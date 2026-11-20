@@ -8,6 +8,50 @@ minor versions.
 
 ---
 
+## [0.10.0] — 2026-11-20
+
+First **public release** of the Next-Gen (raylib) build, as
+[`LOCOSP/WDGoNG`](https://github.com/LOCOSP/WDGoNG). This entry consolidates the
+NG feature set that defines the release.
+
+### Added
+- **EXTRAS** — a sandboxed mini-app platform with a public, signed hub
+  ([`LOCOSP/WDGoNG-HUB`](https://locosp.github.io/WDGoNG-HUB/)): browse, install,
+  rate (banana / peel) and run reviewed extras; official LOCOSP extras shown in
+  green; catalogue signed offline with a hardware key.
+- **Cluster Wardrive** — turn the uConsole's XIAO into an ESP-NOW core for a
+  **Marauder V8** node fleet that sweeps the whole band in parallel; coverage
+  radar, per-node health, adopt-to-join.
+- **Unified LoRa Mesh** — MeshCore and native Meshtastic under one picker, shared
+  chat, node mapping on the map.
+- **Offline whole-world ctOS basemap** — bundled, renders under the markers
+  anywhere on Earth with no internet.
+- **RTL-SDR tools** — ADS-B radar with **track log + KML export**, 433 MHz
+  scanner, **433 Hunter** fox-hunt, **433 Capture** (raw `.cu8` + Flipper-ready
+  `.sub`), emergency-services radio.
+- **Host WiFi card support** (e.g. AC1200 / RTL8812AU) with a per-function
+  **radio matrix** (scan / wardrive / handshake / deauth / BLE → ESP32 / host / auto).
+- **WDGWars online** — pair by code, Chase the White Rabbit objectives, live
+  game-state HUD (rank, team, territory), stable per-device identity.
+- **Loot** — session-log journal (browse captures by date, preview files) and
+  one-file **Backup / Restore**.
+- **Proximity radar** — sense nearby WDGWars players over BLE, a shared protocol
+  across the WDGW firmware family with a rotating, privacy-preserving identity.
+
+### Changed
+- **Relicensed to PolyForm Noncommercial 1.0.0** (source-available; noncommercial
+  use / modify / share; commercial use not permitted).
+- README overhaul; public landing leads with the NG one-line installer, the
+  feature set and hub links, with the classic OG build kept as a secondary option.
+
+### Fixed
+- **GPS** — the AIO power rail is powered again on enable, so GPS can be toggled
+  from in-game as before; `ensure_gps` powers it where it's needed (wardrive / cluster).
+- **ADS-B count** — a session's aircraft total is now distinct ICAO codes, not
+  track-log rows.
+- **WDGWars upload** — JSON-contract handling: empty / HTML / login-redirect
+  responses are treated as "not yet", not as a hard JSON error.
+
 ## [0.9.14] — 2026-10-07
 
 ### Added
