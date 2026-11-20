@@ -1,0 +1,10 @@
+build/
+sdkconfig
+sdkconfig.old
+wifi.conf
+managed_components/
+dependencies.lock
+last_signed/
+.web_token
+.cache/
+.dashboard.json

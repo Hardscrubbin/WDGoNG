@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+preview.png
+charcters/
+*.tmp
+char_test.png

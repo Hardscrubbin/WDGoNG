@@ -1,0 +1,5 @@
+# EXTRAS hub signing keys (PUBLIC halves). One line per key; any one of them may sign.
+# main: hardware signing key
+wdgo-extras-hub ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBE6021XRX8c7bhvOES0Z0t4KwhT/l4YCUQu8cylsQBpUJZANZepH7LtaZnTPYzw5NTenYm4W2lcudUzJKvOvcBU=
+# spare: offline key, used only if the main key is lost or must be retired
+wdgo-extras-hub ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFafeMjiwSlHpUodpGUTV5lwQHelCnZvO9bDj/Q0E/PM
