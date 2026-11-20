@@ -384,7 +384,11 @@ choose which radio serves what, or let `auto` keep the ESP32 as primary.
   a 433 MHz fob with a live RSSI bar + spectrum and a closing-in beep), **433 Capture** (record
   every 433 MHz signal to raw `.cu8` + a decoded log + a Flipper-ready RAW `.sub`).
 - **Flipper Zero**, **Monster RF SubGHz** (CC1101), **PipBoy Watch** (ESP32-S3 watch).
-- **Proximity Radar** — see other WDGWars players nearby over BLE presence.
+- **Proximity Radar** — sense other WDGWars players nearby over BLE. Proximity is a **shared
+  protocol across the WDGW firmware family** (uConsole, Marauder V8, the Badger 2350 badge, and
+  more), so the gear recognises its own in the field — using a **rotating, privacy-preserving
+  identity**: devices can tell "this is WDGW" without exposing who you are or letting anyone
+  track a specific person.
 
 ### WDGWars online — ADDONS
 
