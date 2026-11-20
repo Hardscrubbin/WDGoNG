@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WatchDogsGo NG Extras</title>
+<meta name="description" content="Reviewed community extras for WatchDogsGo NG — signed, checksum-verified, always sandboxed.">
+<style>
+  :root{
+    --bg:#070b12; --panel:#0c111b; --edge:#1d2740; --txt:#cdd6e6; --dim:#7b88a3;
+    --hi:#eaf2ff; --teal:#35e6ff; --purple:#b23bd6; --warn:#ffb020; --ice:#7fd2ff;
+    --banana:#ffd23f; --peel:#c9a227;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+    font:15px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    background-image:linear-gradient(transparent 95%,rgba(178,59,214,.05) 0);background-size:100% 22px}
+  a{color:var(--teal);text-decoration:none}
+  a:hover{text-decoration:underline}
+  header{border-bottom:1px solid var(--purple);padding:28px 20px 18px;max-width:1100px;margin:0 auto}
+  h1{margin:0;font-size:30px;letter-spacing:2px;color:var(--hi)}
+  h1 .accent{color:var(--purple)}
+  .sub{color:var(--dim);margin-top:6px}
+  .warn{color:var(--warn);margin-top:14px;font-weight:700}
+  main{max-width:1100px;margin:0 auto;padding:20px}
+  .bar{display:flex;gap:14px;flex-wrap:wrap;align-items:center;margin-bottom:18px}
+  #q,#sort{background:var(--panel);border:1px solid var(--edge);color:var(--txt);
+    padding:9px 12px;border-radius:7px;font:inherit}
+  #q{flex:1;min-width:200px}
+  .count{color:var(--dim)}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:16px}
+  .card{background:var(--panel);border:1px solid var(--edge);border-radius:10px;padding:16px;
+    display:flex;flex-direction:column;gap:9px}
+  .card h2{margin:0;font-size:18px;color:var(--hi);display:flex;align-items:center;gap:10px}
+  .official{color:var(--ok,#38d66a);font-weight:700}
+  .xicon{width:40px;height:40px;border-radius:6px;image-rendering:pixelated;flex:none}
+  .meta{color:var(--dim);font-size:13px}
+  .desc{color:var(--txt)}
+  .tags{display:flex;gap:6px;flex-wrap:wrap}
+  .tag{background:#111a2b;border:1px solid var(--edge);color:var(--ice);font-size:11px;
+    padding:2px 8px;border-radius:20px}
+  .perm{color:var(--warn)}
+  .votes{display:flex;gap:14px;align-items:center;font-size:14px}
+  .vote{display:inline-flex;gap:5px;align-items:center;font-weight:700}
+  .vote.b{color:var(--banana)} .vote.p{color:var(--peel)}
+  .votes a{margin-left:auto;font-size:13px}
+  .ico{width:20px;height:20px;flex:none}
+  .links{display:flex;gap:16px;flex-wrap:wrap;margin-top:auto;padding-top:8px;
+    border-top:1px solid var(--edge);font-size:13px}
+  .sha{color:var(--dim);font-size:11px;word-break:break-all}
+  footer{max-width:1100px;margin:0 auto;padding:26px 20px;color:var(--dim);
+    border-top:1px solid var(--edge);font-size:13px}
+  footer p{margin:6px 0}
+  .err{color:var(--warn)}
+  code{color:var(--ice)}
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <!-- banana = yes -->
+  <symbol id="i-banana" viewBox="0 0 24 24">
+    <path d="M3.5 12.5c2.6 5.6 11.6 6.4 16-1 1.6-2.7 2-5.6 1.4-8.2" stroke="#ffd23f" stroke-width="4.2" stroke-linecap="round" fill="none"/>
+    <path d="M20.9 3.3l1.1-1.5" stroke="#6b4a1e" stroke-width="2" stroke-linecap="round"/>
+    <path d="M3.5 12.5l-1.3.5" stroke="#6b4a1e" stroke-width="2" stroke-linecap="round"/>
+  </symbol>
+  <!-- banana peel = no -->
+  <symbol id="i-peel" viewBox="0 0 24 24">
+    <path d="M12 2.5v5" stroke="#6b4a1e" stroke-width="2.2" stroke-linecap="round"/>
+    <path d="M12 7.5c-1.2 4.4-4 7.6-8.4 9.6" stroke="#c9a227" stroke-width="3.2" stroke-linecap="round" fill="none"/>
+    <path d="M12 7.5c.2 4.4.2 9 0 13.5" stroke="#c9a227" stroke-width="3.2" stroke-linecap="round" fill="none"/>
+    <path d="M12 7.5c1.2 4.4 4 7.6 8.4 9.6" stroke="#c9a227" stroke-width="3.2" stroke-linecap="round" fill="none"/>
+    <circle cx="6.6" cy="14.6" r=".9" fill="#6b4a1e"/><circle cx="17.6" cy="15.1" r=".9" fill="#6b4a1e"/>
+  </symbol>
+</svg>
+<header>
+  <h1>WatchDogsGo NG <span class="accent">Extras</span></h1>
+  <div class="sub">Reviewed community mini-apps. Signed catalogue, checksum-verified,
+    and always run in a sandbox on the device.</div>
+  <div class="warn">Official extras (green &#10003; LOCOSP) are made by LOCOSP. All others are made by
+    their own authors, not by LOCOSP. Install and run only what you know and trust — at your own risk.</div>
+</header>
+<main>
+  <div class="bar">
+    <input id="q" type="search" placeholder="search name / author / tag / category…" autocomplete="off">
+    <select id="sort" aria-label="sort">
+      <option value="top">top rated</option>
+      <option value="name">name</option>
+    </select>
+    <span class="count" id="count"></span>
+  </div>
+  <div class="grid" id="grid"></div>
+  <p id="status" class="err"></p>
+</main>
+<footer>
+  <p><b>Rate an extra:</b> open its <em>vote</em> link and react
+    <svg class="ico" style="vertical-align:-5px"><use href="#i-banana"/></svg> with 👍 (banana = yes) or
+    <svg class="ico" style="vertical-align:-5px"><use href="#i-peel"/></svg> with 👎 (peel = no).
+    One vote per GitHub account; counts refresh every few hours.</p>
+  <p><b>Install:</b> open <b>EXTRAS &rsaquo; Hub</b> in the game — it verifies the signature
+    and each extra's checksum before installing, and runs every extra sandboxed.
+    <span id="repolink"></span></p>
+  <p><b>Publish one:</b> read the <a id="authlink" href="docs/AUTHORING.md">author guide</a>,
+    test it with <code>tools/run_in_sim.py &lt;dir&gt; 30 --sandbox</code>, and open a pull request.</p>
+</footer>
+<script>
+"use strict";
+// Where the reviewed code lives. On GitHub project Pages (owner.github.io/repo/)
+// we can point straight at the repository's file view; otherwise links degrade to
+// the relative path served next to this page.
+function repoBase(){
+  var h=location.hostname, p=location.pathname.replace(/\/+$/,"");
+  var m=h.match(/^([^.]+)\.github\.io$/);
+  if(m){
+    var seg=p.split("/").filter(Boolean);
+    if(seg.length) return "https://github.com/"+m[1]+"/"+seg[0];
+    return "https://github.com/"+m[1]+"/"+m[1]+".github.io";
+  }
+  return null;
+}
+var REPO=repoBase();
+function srcUrl(id){ return REPO ? REPO+"/tree/HEAD/extras/"+id : "extras/"+id+"/"; }
+function esc(s){ return String(s==null?"":s).replace(/[&<>"]/g,function(c){
+  return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]; }); }
+function httpOnly(u){ u=String(u||""); return /^https?:\/\//.test(u)&&!/\s/.test(u)?u:""; }
+function httpsOnly(u){ u=String(u||""); return /^https:\/\//.test(u)&&!/\s/.test(u)?u:""; }
+function cnt(v){ return (typeof v==="number" && isFinite(v) && v>=0) ? Math.floor(v) : 0; }
+
+var ALL=[], RATE={};
+function rating(id){
+  var r=RATE[id]||{}; return {b:cnt(r.banana), p:cnt(r.peel), url:httpsOnly(r.url)};
+}
+function render(list){
+  var g=document.getElementById("grid"); g.innerHTML="";
+  list.forEach(function(e){
+    var perms=(e.permissions||[]).length?('asks for: <span class="perm">'+esc(e.permissions.join(", "))+'</span>'):'no extra permissions';
+    var tags=(e.tags||[]).map(function(t){return '<span class="tag">'+esc(t)+'</span>';}).join("");
+    var home=httpOnly(e.homepage), r=rating(e.id);
+    var c=document.createElement("div"); c.className="card";
+    c.innerHTML=
+      '<h2>'+(e.icon===true?'<img class="xicon" src="extras/'+encodeURIComponent(e.id)+'/icon.png" width="40" height="40" alt="" loading="lazy">':'')+esc(e.name||e.id)+'</h2>'+
+      '<div class="meta">v'+esc(e.version||"?")+' &middot; by '+(e.official===true?'<span class="official" title="official extra from the hub maintainer">'+esc(e.author||"?")+' &#10003;</span>':esc(e.author||"?"))+' &middot; '+esc(e.category||"misc")+'</div>'+
+      '<div class="desc">'+esc(e.description||"")+'</div>'+
+      (tags?'<div class="tags">'+tags+'</div>':'')+
+      '<div class="meta">'+perms+'</div>'+
+      '<div class="votes">'+
+        '<span class="vote b" title="bananas (yes)"><svg class="ico"><use href="#i-banana"/></svg>'+r.b+'</span>'+
+        '<span class="vote p" title="peels (no)"><svg class="ico"><use href="#i-peel"/></svg>'+r.p+'</span>'+
+        (r.url?'<a href="'+esc(r.url)+'" rel="noopener nofollow" title="react 👍 = banana, 👎 = peel">vote</a>':'')+
+      '</div>'+
+      '<div class="links">'+
+        '<a href="'+esc(srcUrl(e.id))+'" rel="noopener">view reviewed source</a>'+
+        (home?'<a href="'+esc(home)+'" rel="noopener nofollow">author&rsquo;s repo</a>':'')+
+      '</div>'+
+      '<div class="sha">sha256 '+esc(e.sha||"")+'</div>';
+    g.appendChild(c);
+  });
+  document.getElementById("count").textContent=list.length+" / "+ALL.length+" extra(s)";
+}
+function nameOf(e){ return String(e.name||e.id).toLowerCase(); }
+function applyView(){
+  var q=document.getElementById("q").value.toLowerCase().trim();
+  var list=!q?ALL.slice():ALL.filter(function(e){
+    return [e.name,e.author,e.category,e.description,(e.tags||[]).join(" ")]
+      .join(" ").toLowerCase().indexOf(q)>=0;
+  });
+  if(document.getElementById("sort").value==="top"){
+    list.sort(function(a,b){
+      var ra=rating(a.id), rb=rating(b.id);
+      return (rb.b-rb.p)-(ra.b-ra.p) || rb.b-ra.b || nameOf(a).localeCompare(nameOf(b));
+    });
+  }else{
+    list.sort(function(a,b){ return nameOf(a).localeCompare(nameOf(b)); });
+  }
+  render(list);
+}
+document.getElementById("q").addEventListener("input",applyView);
+document.getElementById("sort").addEventListener("change",applyView);
+if(REPO){
+  document.getElementById("authlink").href=REPO+"/blob/HEAD/docs/AUTHORING.md";
+  document.getElementById("repolink").innerHTML=
+    'Hub repository: <a href="'+esc(REPO)+'" rel="noopener">'+esc(REPO)+'</a>.';
+}
+
+// ratings.json is optional display data: a missing or broken file just shows zeros.
+var ratingsP=fetch("ratings.json",{cache:"no-store"})
+  .then(function(r){ return r.ok?r.json():{}; }).catch(function(){ return {}; });
+var indexP=fetch("index.json",{cache:"no-store"}).then(function(r){
+  if(!r.ok) throw new Error("index.json HTTP "+r.status); return r.json();
+});
+Promise.all([indexP,ratingsP]).then(function(res){
+  var ex=(res[0]&&res[0].extras)||{};
+  var rx=(res[1]&&res[1].extras); RATE=(rx&&typeof rx==="object")?rx:{};
+  ALL=Object.keys(ex).map(function(k){ var e=ex[k]||{}; e.id=k; return e; });
+  if(!ALL.length){ document.getElementById("status").textContent="The catalogue is empty for now."; }
+  applyView();
+}).catch(function(e){
+  document.getElementById("status").textContent="Could not load the catalogue ("+e.message+").";
+});
+</script>
+</body>
+</html>

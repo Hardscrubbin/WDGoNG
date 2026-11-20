@@ -1,0 +1,91 @@
+name: hub
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    paths: ["extras/**", "tools/**", "official.json"]
+  schedule:
+    - cron: "17 */6 * * *"      # refresh banana / peel counts
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Every PR: contributors may only add/change extras/<id>/. Generated files are
+  # rebuilt by the publish job, never edited by hand (that includes the vote
+  # counts). Then gate each changed extra; untrusted code runs ONLY inside the
+  # sandbox (as root on the runner, so the smoke run is kernel-jailed like on a device).
+  check:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0, persist-credentials: false }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13" }
+      - name: generated files are not edited by hand
+        run: |
+          set -e
+          bad=$(git diff --name-only "origin/${{ github.base_ref }}"...HEAD -- index.json index.json.sig pending ratings.json official.json)
+          [ -z "$bad" ] || { echo "PR edits generated file(s): $bad - these are rebuilt on merge"; exit 1; }
+      - name: check changed extras
+        run: |
+          set -e
+          ids=$(git diff --name-only "origin/${{ github.base_ref }}"...HEAD -- extras/ | cut -d/ -f2 | sort -u)
+          [ -z "$ids" ] && { echo "no extras changed"; exit 0; }
+          for id in $ids; do
+            [ -d "extras/$id" ] || { echo "removed: $id"; continue; }
+            sudo "$(which python3)" tools/hub_check.py "extras/$id" --sdk tools/sdk
+          done
+
+  # After a reviewed merge: rebuild the CANDIDATE catalogue (pending/index.json), open
+  # a vote issue for any new extra, refresh the counts. Nothing is signed here: there
+  # is no signing key on any runner. The maintainer signs the candidate offline and
+  # publishes index.json + index.json.sig; until then players keep the last release.
+  pending:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    concurrency: { group: hub-main, cancel-in-progress: false }
+    permissions:
+      contents: write
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13" }
+      - name: build the candidate catalogue
+        run: python3 tools/hub_build_index.py . --sdk tools/sdk --out pending/index.json
+      - name: vote issues + counts
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 tools/hub_ratings.py .
+      - name: commit
+        run: |
+          git config user.name "hub-bot"; git config user.email "hub-bot@users.noreply.github.com"
+          git add pending/index.json ratings.json
+          git diff --cached --quiet || git commit -m "pending: rebuild candidate catalogue, refresh ratings"
+          git push
+
+  # Every few hours: refresh banana / peel counts only (no catalogue change).
+  ratings:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    concurrency: { group: hub-main, cancel-in-progress: false }
+    permissions:
+      contents: write
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13" }
+      - name: vote issues + counts
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 tools/hub_ratings.py .
+      - name: commit if changed
+        run: |
+          git config user.name "hub-bot"; git config user.email "hub-bot@users.noreply.github.com"
+          git add ratings.json
+          git diff --cached --quiet || { git commit -m "ratings: refresh"; git push; }

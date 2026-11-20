@@ -1,0 +1,56 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+loot/
+maps/
+firmware_cache/
+secrets.conf
+*.log
+CLAUDE.md
+deploy_watchdogs.sh
+# Personal recordings — keep them out of public repos
+*.mov
+*.mp4
+# Exception: bg.mp4 is the public landing page video (in both locations)
+!docs/site/bg.mp4
+!docs/bg.mp4
+# Plugin state files (per-user, not shared)
+plugins/.wardrive_state.json
+plugins/.wardrive_uploaded.json
+# NG portal-sync state (per-device, tracks which loot sessions were uploaded)
+.portal_sync_state.json
+# OS junk
+.DS_Store
+Thumbs.db
+
+# --- Sensitive / personal data — must NEVER reach any remote (incl. private) ---
+# GPS-tagged RF & wardriving logs, packet/handshake captures, per-user runtime
+# logs. loot/ above already covers the session dirs; these add belt-and-braces
+# for anything written elsewhere in the tree.
+*.csv
+*.pcap
+*.pcapng
+*.hccapx
+*.22000
+*.cap
+.watchdogs/
+evil_twin_capture.log
+attack_events.log
+# Local scratch / debug artefacts
+scratch_*
+scratchpad/
+
+# Third-party firmware binaries (JanOS RF / projectZero flashes) — not ours to redistribute
+assets/*.bin
+whitelist.json
+wdgong_ui/assets/map/basemap.mbtiles
+
+# Fleet keys / secrets — NEVER commit (bridge loads from ~/.wdgo/fleet.key, outside the repo)
+*.key
+fleet.key
+.wdgo/
+portal_sync.log
+portal_sync.log.1
+keyhunt_target.json
+radio.json
