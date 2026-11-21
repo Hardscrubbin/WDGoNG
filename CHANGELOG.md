@@ -8,6 +8,20 @@ minor versions.
 
 ---
 
+## [0.10.1] — 2026-11-22
+
+### Fixed
+- **Bundled offline ctOS world basemap.** The ~28 MB `basemap.mbtiles` (WDG ctOS
+  Basemap, whole world, zoom 0–6) was excluded by a `.gitignore` rule, so it was
+  missing from the public repo and the v0.10.0 release — the map renderer shipped
+  but the map database did not, leaving players with only the radar/grid and no
+  map backdrop. The basemap is now tracked and bundled, so a fresh clone or an
+  in-game **Update** gets the world map. (Reported in
+  [#1](https://github.com/LOCOSP/WDGoNG/issues/1).) Note: the map still needs a
+  GPS fix to centre on you — without one it sits at `lat/lon 0,0`.
+
+---
+
 ## [0.10.0] — 2026-11-20
 
 First **public release** of the Next-Gen (raylib) build, as
