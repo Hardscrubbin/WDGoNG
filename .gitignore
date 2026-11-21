@@ -44,7 +44,6 @@ scratchpad/
 # Third-party firmware binaries (JanOS RF / projectZero flashes) — not ours to redistribute
 assets/*.bin
 whitelist.json
-wdgong_ui/assets/map/basemap.mbtiles
 
 # Fleet keys / secrets — NEVER commit (bridge loads from ~/.wdgo/fleet.key, outside the repo)
 *.key
