@@ -161,24 +161,99 @@ if command -v apt-get &>/dev/null && [ -f /sys/firmware/devicetree/base/model ] 
     if command -v meshtasticd &>/dev/null; then
         ok "meshtasticd already installed"
     else
-        DEB_VER="$(. /etc/os-release 2>/dev/null; echo "${VERSION_ID:-12}")"
-        OBS="https://download.opensuse.org/repositories/network:/Meshtastic:/beta/Debian_${DEB_VER}"
-        info "Adding Meshtastic OBS repo (Debian_${DEB_VER}) + installing meshtasticd..."
-        {
-            sudo mkdir -p /etc/apt/keyrings
-            curl -fsSL "${OBS}/Release.key" | gpg --dearmor \
-                | sudo tee /etc/apt/keyrings/meshtastic.gpg >/dev/null
-            echo "deb [signed-by=/etc/apt/keyrings/meshtastic.gpg] ${OBS}/ /" \
-                | sudo tee /etc/apt/sources.list.d/meshtastic.list >/dev/null
-            sudo apt-get update
-            sudo apt-get install -y meshtasticd
-        } >>"$APT_LOG" 2>&1
-        if command -v meshtasticd &>/dev/null; then
-            sudo systemctl mask meshtasticd >>"$APT_LOG" 2>&1 || true
-            ok "meshtasticd installed (auto-start masked; the game drives it)"
-        else
-            warn "meshtasticd not installed — Meshtastic stays unavailable (MeshCore still works). See $APT_LOG"
+        # The OBS beta channel ships Debian_<ver> + Raspbian_<ver> only (no Ubuntu).
+        # Blindly building "Debian_<VERSION_ID>" 404s on Ubuntu (and on any VERSION_ID
+        # without a matching repo), which under `set -e` aborted the WHOLE setup. So:
+        # build best-match candidates for this distro, PROBE each, use the first that
+        # exists, and keep every step non-fatal (meshtasticd is optional; MeshCore
+        # works without it). Ubuntu simply has no repo here -> graceful skip.
+        # Map THIS distro to the right base via ID/ID_LIKE + the Debian codename, then
+        # PROBE candidates and use the first that exists. Covers Debian, Raspberry Pi
+        # OS, Raspbian, and Debian derivatives (Kali -> trixie/13, Parrot -> bookworm/12);
+        # Ubuntu-based (incl. DragonOS) have no repo here -> graceful skip. Fallbacks to
+        # Debian_13/12 guarantee a working repo for any debian-family system.
+        _osid="$(. /etc/os-release 2>/dev/null; echo "${ID:-debian}" | tr 'A-Z' 'a-z')"
+        _idlike="$(. /etc/os-release 2>/dev/null; echo "${ID_LIKE:-}" | tr 'A-Z' 'a-z')"
+        _code="$(. /etc/os-release 2>/dev/null; echo "${VERSION_CODENAME:-}" | tr 'A-Z' 'a-z')"
+        _osver="$(. /etc/os-release 2>/dev/null; echo "${VERSION_ID:-}")"
+        case "$_code" in
+            trixie|sid|kali-rolling) _dn=13 ;;
+            bookworm|lory)           _dn=12 ;;
+            *)                       _dn="" ;;
+        esac
+        _pref="${_dn:-${_osver:-13}}"
+        if [ "$_osid" = ubuntu ] || printf '%s' "$_idlike" | grep -qw ubuntu; then
+            _cands=""                                    # Ubuntu / DragonOS -> no OBS repo
+        elif [ "$_osid" = raspbian ]; then
+            _cands="Raspbian_${_pref} Debian_${_pref} Raspbian_13 Debian_13 Raspbian_12 Debian_12"
+        else                                             # debian, kali, parrot, raspberry pi os, ...
+            _cands="Debian_${_pref} Raspbian_${_pref} Debian_13 Debian_12"
         fi
+        _OBS_BASE="https://download.opensuse.org/repositories/network:/Meshtastic:/beta"
+        OBS=""; OBS_DIST=""
+        for _d in $_cands; do
+            if curl -fsSL -m 10 --retry 1 -o /dev/null "${_OBS_BASE}/${_d}/Release.key" 2>/dev/null; then
+                OBS_DIST="$_d"; OBS="${_OBS_BASE}/${_d}"; break
+            fi
+        done
+        if [ -z "$OBS" ] && [ -n "$_cands" ]; then       # probe inconclusive (throttle/offline)
+            OBS_DIST="${_cands%% *}"                      # but debian-family: best-effort try
+            OBS="${_OBS_BASE}/${OBS_DIST}"                # (apt step is non-fatal; bad repo cleaned up)
+        fi
+        if [ -n "$OBS" ]; then
+            info "Adding Meshtastic OBS repo (${OBS_DIST}) + installing meshtasticd..."
+            {
+                sudo mkdir -p /etc/apt/keyrings
+                curl -fsSL "${OBS}/Release.key" | gpg --dearmor \
+                    | sudo tee /etc/apt/keyrings/meshtastic.gpg >/dev/null
+                echo "deb [signed-by=/etc/apt/keyrings/meshtastic.gpg] ${OBS}/ /" \
+                    | sudo tee /etc/apt/sources.list.d/meshtastic.list >/dev/null
+                sudo apt-get update
+                sudo apt-get install -y meshtasticd
+            } >>"$APT_LOG" 2>&1 || true
+            if command -v meshtasticd &>/dev/null; then
+                sudo systemctl mask meshtasticd >>"$APT_LOG" 2>&1 || true
+                ok "meshtasticd installed (auto-start masked; the game drives it)"
+            else
+                sudo rm -f /etc/apt/sources.list.d/meshtastic.list 2>/dev/null || true
+                warn "meshtasticd install failed — Meshtastic stays unavailable (MeshCore still works). See $APT_LOG"
+            fi
+        else
+            warn "No Meshtastic repo for ${_osid} ${_osver} (OBS beta = Debian/Raspbian only) — skipping. MeshCore still works."
+        fi
+    fi
+fi
+
+# --- 3c. labwc fullscreen rule (uConsole / labwc) — fill the rotated DSI panel ---
+# GLFW/raylib mis-sizes its window to 720x720 on the uConsole's rotated DSI panel
+# under Wayland/labwc, so the game leaves fullscreen to the compositor. A fresh
+# labwc has no rule for the game window -> tiny square. Add a window rule that
+# auto-fullscreens "WatchDogsGo". Idempotent, backs up rc.xml, fully non-fatal.
+if command -v labwc &>/dev/null; then
+    echo "[3c/8] Adding labwc fullscreen rule for the game window..."
+    if python3 - <<'PYLABWC'
+import os, re, sys, pathlib
+rc = pathlib.Path(os.path.expanduser("~/.config/labwc/rc.xml"))
+inner = '<windowRule title="WatchDogsGo"><action name="ToggleFullscreen"/></windowRule>'
+block = "  <windowRules>\n    " + inner + "\n  </windowRules>\n"
+rc.parent.mkdir(parents=True, exist_ok=True)
+txt = rc.read_text() if rc.exists() else '<?xml version="1.0"?>\n<labwc_config>\n</labwc_config>\n'
+if 'title="WatchDogsGo"' in txt:
+    print("rule already present"); sys.exit(0)
+if rc.exists():
+    rc.with_name("rc.xml.wdgo.bak").write_text(txt)      # backup before touching
+if re.search(r'<windowRules[^>]*>', txt):
+    txt = re.sub(r'(<windowRules[^>]*>)', r'\1\n    ' + inner, txt, count=1)
+else:
+    m = re.search(r'</(labwc_config|openbox_config)>', txt)
+    txt = (txt[:m.start()] + block + txt[m.start():]) if m else (txt.rstrip() + "\n" + block)
+rc.write_text(txt); print("rule added")
+PYLABWC
+    then
+        ok "labwc rule set in ~/.config/labwc/rc.xml (game auto-fullscreens)"
+        labwc --reconfigure >/dev/null 2>&1 || true     # applies now if a session is live
+    else
+        warn "Could not update labwc rc.xml — set fullscreen manually (press F in-game)."
     fi
 fi
 

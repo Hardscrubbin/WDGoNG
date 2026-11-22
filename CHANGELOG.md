@@ -8,6 +8,24 @@ minor versions.
 
 ---
 
+## [0.10.2] — 2026-11-22
+
+### Fixed
+- **Setup no longer aborts on non-Debian / fresh systems.** The optional
+  `meshtasticd` step built a hardcoded `Debian_<VERSION_ID>` OBS repo path that
+  404s on Ubuntu (and any non-matching version), and under `set -e` that took the
+  whole install down. It is now distro-aware (Debian, Raspberry Pi OS, Raspbian,
+  Kali and Parrot map to the right Debian/Raspbian OBS repo; Ubuntu and DragonOS,
+  which have no repo there, skip cleanly) and fully non-fatal. `meshtasticd` is
+  optional and MeshCore works without it.
+- **Game window now fills the uConsole screen out of the box.** On the rotated DSI
+  panel the window came up as a tiny 720×720 square, because fullscreen is left to
+  the compositor and a fresh labwc had no rule for it. Setup now installs a labwc
+  window rule that auto-fullscreens the game (idempotent, backs up `rc.xml`).
+  Thanks to the community for pinning both of these down.
+
+---
+
 ## [0.10.1] — 2026-11-22
 
 ### Fixed
