@@ -40,6 +40,7 @@ RTL433_CMD_DEV1 = RTL433_CMD + ["-d", "1"]
 
 ADSB_TIMEOUT = 60  # remove aircraft not seen for 60s
 SENSOR_TIMEOUT = 300  # remove sensors not seen for 5min
+PRUNE_INTERVAL = 5  # min seconds between real prune_stale() scans (safe to call per-frame)
 
 
 @dataclass
@@ -922,17 +923,25 @@ class SDRManager:
         return events
 
     def prune_stale(self):
-        """Remove aircraft/sensors not seen recently."""
-        now = time.time()
-        stale_ac = [k for k, v in self.aircraft.items()
-                    if now - v.last_seen > ADSB_TIMEOUT]
-        for k in stale_ac:
-            del self.aircraft[k]
+        """Drop aircraft / 433 sensors not heard within their timeout so they do
+        not pile up (and progressively lag the radar) over a long SDR session.
 
-        stale_s = [k for k, v in self.sensors.items()
-                   if now - v.last_seen > SENSOR_TIMEOUT]
-        for k in stale_s:
-            del self.sensors[k]
+        Safe to call every frame from the render/poll thread: it snapshots each
+        dict with list() before deleting, so the background SBS reader thread can
+        keep adding entries concurrently without a "dict changed size during
+        iteration" race, and it only runs a real scan every PRUNE_INTERVAL
+        seconds (the timeouts are tens of seconds, so coarser granularity is
+        fine). pop(..., None) tolerates a key the reader already replaced."""
+        now = time.time()
+        if now - getattr(self, "_last_prune", 0.0) < PRUNE_INTERVAL:
+            return
+        self._last_prune = now
+        for k, v in list(self.aircraft.items()):
+            if now - v.last_seen > ADSB_TIMEOUT:
+                self.aircraft.pop(k, None)
+        for k, v in list(self.sensors.items()):
+            if now - v.last_seen > SENSOR_TIMEOUT:
+                self.sensors.pop(k, None)
 
     def update_gps(self, lat: float, lon: float):
         """Update GPS position for tagging new sensors / logs. Ignores None so a

@@ -2759,14 +2759,16 @@ def main():
         # battery indicator (left of the GPS coords)
         bpct = bk.read_battery()
         if bpct >= 0:
-            bcol = SUCCESS if bpct > 25 else (WARN if bpct > 10 else DANGER)
-            blink_b = bpct > 10 or int(t * 3) % 2 == 0
+            bmv = bk.battery_mv()
+            low_v = bool(bmv) and bmv < 3450          # AXP223 % lies under load; trust voltage
+            bcol = DANGER if low_v else (SUCCESS if bpct > 25 else (WARN if bpct > 10 else DANGER))
+            blink_b = (bpct > 10 and not low_v) or int(t * 3) % 2 == 0
             bxx = int(gpsx) - 90
             if blink_b:
                 draw_rectangle_lines_ex(Rectangle(bxx, sy + 12, 26, 14), 1, bcol)
                 draw_rectangle(bxx + 26, sy + 15, 2, 8, bcol)
                 draw_rectangle(bxx + 2, sy + 14, int(22 * bpct / 100), 10, bcol)
-            text(mono, "%d%%" % bpct, bxx + 34, sy + 11, 16, bcol)
+            text(mono, ("%.2fV" % (bmv / 1000.0)) if low_v else ("%d%%" % bpct), bxx + 34, sy + 11, 16, bcol)
 
         # key hints — tucked UNDER the brand + module chips (not crammed above
         # them), in TXT so they actually read against the bar
@@ -2871,6 +2873,10 @@ def main():
             led(c3, yy, "LoRa", bk.lora_on(), "ON" if bk.lora_on() else "OFF", SUCCESS if bk.lora_on() else DANGER); yy += 30
             led(c3, yy, "RADIO", bk.sdr_on(), (bk.sdr_mode().upper() or "ON") if bk.sdr_on() else "OFF",
                 SUCCESS if bk.sdr_on() else DANGER); yy += 30
+            _bmv = bk.battery_mv(); _bpct = bk.read_battery(); _blow = bool(_bmv) and _bmv < 3450
+            led(c3, yy, "BATT", not _blow,
+                ("%d%% %.2fV" % (_bpct, _bmv / 1000.0)) if _bmv else ("%d%%" % _bpct),
+                DANGER if _blow else (SUCCESS if _bpct > 25 else WARN)); yy += 30
             ops = []
             if scanning: ops.append("SCAN")
             if bk.state and bk.state.evil_twin_running: ops.append("ET")
