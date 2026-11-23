@@ -333,6 +333,7 @@ class MeshtasticManager:
         try:
             self._iface.sendText(text)
             self.messages.append((self.my_name or "me", text, time.time()))
+            self.messages = self.messages[-300:]   # cap: appended from two threads, never trimmed
         except Exception as exc:
             self._emit("Meshtastic send failed: %s" % exc, "warn")
 
@@ -347,6 +348,7 @@ class MeshtasticManager:
             frm = str((packet or {}).get("fromId") or (packet or {}).get("from") or "?")
             name = self._nodes.get(frm, {}).get("name") or frm
             self.messages.append((name, text, time.time()))
+            self.messages = self.messages[-300:]   # cap: appended from two threads, never trimmed
             if self._on_message:
                 self._on_message(name, text)
         except Exception as exc:

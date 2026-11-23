@@ -972,6 +972,12 @@ class Backend:
             except Exception:
                 pass
             try:
+                _px = self._mgrs.get("prox")   # kill the proximity BLE child procs, else they
+                if _px is not None:            # outlive the game, hold hci0 and keep scanning/advertising
+                    _px.shutdown()             # (kills scan+adv procs, keeps the on/off preference)
+            except Exception:
+                pass
+            try:
                 if modules == "off":
                     self._set_modules({"gps": False, "lora": False, "sdr": False})
                 elif self._entry_rails:
@@ -1245,6 +1251,8 @@ class Backend:
         self.term.append((time.strftime("%H:%M:%S"), msg, kind))
         if len(self.term) > 300:
             self.term = self.term[-300:]
+            self.mc_log = self.mc_log[-300:]   # grows from the LoRa reader thread; cap like term
+            self.wd_log = self.wd_log[-300:]   # grows from the Reticulum thread; cap like term
 
     # ------------------------------------------------------------------
     # Commands
@@ -2496,11 +2504,23 @@ class Backend:
         self.mc_bubble = (str(message)[:60], time.time() + 5.0)
         self._notify_pulse = "mesh"           # UI plays the notify sound on the main thread
         self.earn_badge("meshcore")
+        try:                                  # persist to loot (was UI-only before)
+            self.ensure_session()
+            if self.loot:
+                self.loot.save_meshcore_message(str(channel), str(message), float(rssi or 0))
+        except Exception:
+            pass
 
     def _mc_on_dm(self, from_id, message, rssi=0, hops=0):
         self.mc_log.append(("in", "[DM] " + str(message), "dm"))
         self.mc_bubble = ("[DM] " + str(message)[:54], time.time() + 5.0)
         self._notify_pulse = "mesh"
+        try:                                  # persist DMs too (was UI-only; channel msgs already save)
+            self.ensure_session()
+            if self.loot:
+                self.loot.save_meshcore_message("DM:" + str(from_id), str(message), float(rssi or 0))
+        except Exception:
+            pass
 
     def is_muted(self) -> bool:
         return bool(getattr(self, "_muted", False))
@@ -2522,7 +2542,10 @@ class Backend:
             except Exception:
                 pass
 
-    def _mc_on_node(self, node_id, ntype=0, name="", lat=0.0, lon=0.0, rssi=0, snr=0):
+    def _mc_on_node(self, node_id, ntype=0, name="", lat=0.0, lon=0.0, rssi=0, snr=0, pubkey=b""):
+        # pubkey is the 8th arg LoRaManager passes for MeshCore adverts; accept it
+        # (the old 7-arg signature raised TypeError on every advert, silently caught
+        # in lora_manager, so NO node ever reached loot/map/WDGWars).
         try:
             lat, lon = float(lat or 0), float(lon or 0)
             nm = str(name or node_id)[:16]
@@ -2530,6 +2553,10 @@ class Backend:
                 self._mc_nodes[str(node_id)] = {
                     "lat": lat, "lon": lon, "name": nm, "type": ntype}
             self._log_mesh_node(str(node_id), str(ntype), nm, lat, lon, rssi, snr)
+            if self.loot:                     # fill the CONTACTS panel/counter (store was never populated)
+                self.loot.save_contact(str(node_id), {"name": nm, "type": ntype,
+                                                      "lat": lat, "lon": lon,
+                                                      "rssi": rssi, "snr": snr})
         except Exception:
             pass
 
@@ -2804,7 +2831,7 @@ class Backend:
         out = []
         if m is not None:
             try:
-                for ac in m.aircraft.values():
+                for ac in list(m.aircraft.values()):   # snapshot: _sbs_reader mutates from another thread
                     if getattr(ac, "has_position", False):
                         out.append({"lat": ac.lat, "lon": ac.lon, "alt": int(ac.altitude),
                                     "cs": (ac.callsign or ac.icao or "?"),
@@ -2830,7 +2857,7 @@ class Backend:
         out = []
         if m is not None:
             try:
-                for s in m.sensors.values():
+                for s in list(m.sensors.values()):   # snapshot: _rtl433_reader mutates from another thread
                     if getattr(s, "lat", 0) or getattr(s, "lon", 0):
                         out.append({"lat": s.lat, "lon": s.lon, "sid": getattr(s, "sid", ""),
                                     "model": getattr(s, "model", "")})
@@ -2844,7 +2871,7 @@ class Backend:
         if m is None or not getattr(m, "emergency_active", False):
             return (False, "", 0)
         try:
-            sigs = [s for s in m.emergency.values() if getattr(s, "active", False)]
+            sigs = [s for s in list(m.emergency.values()) if getattr(s, "active", False)]
             if sigs:
                 top = max(sigs, key=lambda s: getattr(s, "rssi", -999))
                 return (True, str(getattr(top, "band", "")), int(getattr(top, "rssi", 0)))
@@ -3068,9 +3095,10 @@ class Backend:
             from watchdogs.reticulum_manager import ReticulumManager
             wd = ReticulumManager(nick=self.node_name(),
                                   configdir=self._reticulum_configdir())
-            wd._on_message = lambda nick, text: self.wd_log.append(("in", "%s: %s" % (nick, text), "in"))
+            wd._on_message = self._wd_on_message
             wd._on_status = lambda text: self.wd_log.append(("sys", str(text), "sys"))
             wd._on_delivered = lambda tok: None
+            wd._on_failed = lambda tok: self.wd_log.append(("sys", "message delivery failed", "sys"))
             wd.start()
             self._wd = wd
             self.wd_log.append(("sys", "connecting to #general...", "sys"))
@@ -3079,6 +3107,15 @@ class Backend:
             self._wd = None
         return self._wd
 
+    def _wd_on_message(self, nick, text):
+        self.wd_log.append(("in", "%s: %s" % (nick, text), "in"))
+        try:                                  # persist WDGWars chat (was UI-only -> lost on exit)
+            self.ensure_session()
+            if self.loot:
+                self.loot.save_wdgwars_message(str(nick), str(text))
+        except Exception:
+            pass
+
     def wd_send(self, text: str) -> None:
         wd = self.start_wdgwars()
         if wd is None:
@@ -3086,6 +3123,12 @@ class Backend:
         try:
             wd.send(text)
             self.wd_log.append(("out", "%s: %s" % (getattr(wd, "nick", "you"), text), "out"))
+            try:                              # persist our own outgoing chat too
+                self.ensure_session()
+                if self.loot:
+                    self.loot.save_wdgwars_message(str(getattr(wd, "nick", "you")), str(text))
+            except Exception:
+                pass
         except Exception as exc:
             self._term(f"[WD] send: {exc}", "warn")
 

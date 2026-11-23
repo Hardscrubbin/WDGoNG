@@ -12,6 +12,32 @@ minor versions.
 
 ---
 
+## [0.10.5] — 2026-11-23
+
+### Fixed
+- **MeshCore adverts + messages are logged again.** `_mc_on_node` took 7 args but
+  the LoRa manager calls the node callback with 8 (it passes the pubkey); every
+  advert raised a `TypeError` swallowed by `except: pass`, so no MeshCore node ever
+  reached loot / the map / WDGWars. Incoming channel messages (and now DMs) were
+  also UI-only. Both now persist. (Reported by hypnox.)
+- **Proximity no longer outlives the game.** Quitting never stopped the proximity
+  BLE child processes, so they kept holding the controller and scanning/advertising
+  after exit (and fought the next launch for it). Quit now shuts them down, and the
+  radio supervisor kills a half-dead scan/advertise pair before respawning instead
+  of orphaning the survivor.
+- **WDGWars #general chat is saved.** Chat was kept only in memory and lost on exit;
+  it now persists to loot (incoming and your own messages). Delivery failures are
+  surfaced in the chat log instead of being silently dropped.
+- **CONTACTS panel is populated.** MeshCore nodes now fill the contacts store the
+  panel and counter read, which were always empty before.
+- **Memory no longer grows unbounded** on long sessions: the MeshCore log, the
+  WDGWars chat log and the Meshtastic message list are capped like the terminal was.
+- **ADS-B radar stops flickering / dropping contacts.** The aircraft, 433 MHz sensor
+  and emergency readers mutate their dicts on background threads; the UI now
+  snapshots them before iterating instead of racing the live dict.
+
+---
+
 ## [0.10.4] — 2026-11-23
 
 ### Changed

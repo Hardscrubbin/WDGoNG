@@ -96,6 +96,9 @@ class ProximityManager:
     def _spawn(self):
         if self.running():
             return
+        # running() is True only when BOTH procs live; if one died we must clear the
+        # survivor before respawning, or we orphan it and leak processes fighting hci0.
+        self._kill()
         self._last_spawn = time.time()
         # SCANNER: scan-only (continuous, reliable) -> sees peers + writes the snapshot.
         # We no longer advertise from the peer: btmgmt add-adv is unusable on this UART
@@ -122,6 +125,7 @@ class ProximityManager:
         _repo = os.path.dirname(os.path.dirname(os.path.dirname(PEER_SCRIPT)))
         adv_args = [sys.executable, "-m", "watchdogs.proximity.dbus_adv",
                     "--secret", self._secret()]
+        _log = None
         try:
             _log = open("/tmp/wdgprox_peer.log", "a")
             self.proc = subprocess.Popen(
@@ -132,6 +136,10 @@ class ProximityManager:
                 close_fds=True, env=env, cwd=_repo)
         except Exception:
             self.proc = None
+        finally:
+            if _log is not None:
+                try: _log.close()    # children kept their own dup; don't leak the parent's fd
+                except Exception: pass
 
     @staticmethod
     def _end(p):
