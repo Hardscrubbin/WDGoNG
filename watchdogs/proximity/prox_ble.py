@@ -29,6 +29,14 @@ _IRQ_SCAN_DONE = 6
 _ADV_NAME_SHORT = 0x08
 _ADV_NAME_FULL = 0x09
 _ADV_MFG = 0xFF
+_ADV_SVC16 = 0x16                         # Service Data, 16-bit UUID
+
+# WDGWars device-type tag: a Service Data AD (0x16) under a reserved 16-bit UUID,
+# one ASCII char for the hardware kind. It rides ALONGSIDE the name + echoes, so a
+# parser that reads only the name/echoes (older firmware) ignores it — no wire
+# regression — while updated ones can show the device model.
+WDG_SVC_UUID = b"\xf0\xff"                # 0xFFF0, little-endian
+DEVTYPE_LABEL = {"Z": "WDGoNG Zero", "U": "uConsole", "M": "Marauder", "B": "Badge"}
 
 # How many peer fingerprints we advertise back. Each is two bytes: enough for
 # the other side to recognise itself, small enough to fit beside the name in
@@ -76,6 +84,18 @@ def adv_echoes(payload):
     return out
 
 
+def adv_devtype(payload):
+    """The advertised WDGWars device-type char ('Z'/'U'/'M'/'B'), or '' if none."""
+    for v in _adv_fields(payload, _ADV_SVC16):
+        v = bytes(v)
+        if len(v) >= 3 and v[:2] == WDG_SVC_UUID:
+            try:
+                return v[2:].decode("ascii", "ignore")[:1]
+            except Exception:
+                return ""
+    return ""
+
+
 def fingerprint(ident):
     """Two bytes of an identity, for echoing back inside an advertisement.
 
@@ -92,11 +112,14 @@ def fingerprint(ident):
         return b"\x00\x00"
 
 
-def build_payload(name, echoes=()):
-    """Flags + complete local name + up to ECHO_MAX peer fingerprints."""
+def build_payload(name, echoes=(), devtype=""):
+    """Flags + complete local name + optional device-type tag + up to ECHO_MAX echoes."""
     nb = name.encode("utf-8")[:20]
     out = bytearray(b"\x02\x01\x06")
     out += bytes([len(nb) + 1, _ADV_NAME_FULL]) + nb
+    if devtype:                              # device-type as service data (old parsers ignore AD 0x16)
+        body = WDG_SVC_UUID + devtype.encode("ascii", "ignore")[:1]
+        out += bytes([len(body) + 1, _ADV_SVC16]) + body
     ech = b"".join(echoes[:ECHO_MAX])
     if ech:
         body = _COMPANY + ech
