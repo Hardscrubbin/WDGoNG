@@ -501,6 +501,8 @@ def main():
     pending_scan = None      # scan type launched from SCAN tab, awaiting completion
     pending_scan_t = 0.0     # when that scan was launched (safety-net timer)
     zoom = 1.0               # map zoom factor
+    map_pan = [0.0, 0.0]     # D-pad pan offset (dlat, dlon) added to your position; 0 recenters
+    _last_coslat = 1.0       # last frame's cos(lat), so pan speed matches E-W on screen
     ZOOM_LABELS = [(0.6, "REGION"), (0.85, "CITY"), (1.0, "DISTRICT"),
                    (1.4, "STREET"), (1.9, "BLOCK"), (2.5, "CLOSE")]
     cluster_sel = -1         # selected cluster on the map (-1 = none / nav off)
@@ -1210,7 +1212,18 @@ def main():
             # to a whole-world view where the z0-6 offline basemap shows real detail
             if is_key_pressed(KEY_EQUAL) or is_key_pressed(KEY_KP_ADD): zoom = min(1.9, zoom * 1.5)   # cap zoom-in at Block
             if is_key_pressed(KEY_MINUS) or is_key_pressed(KEY_KP_SUBTRACT): zoom = max(0.0004, zoom / 1.5)  # zoom-out floor; basemap clamp stops it at the map edge
-            if is_key_pressed(KEY_ZERO) or is_key_pressed(KEY_KP_0): zoom = 1.0
+            if is_key_pressed(KEY_ZERO) or is_key_pressed(KEY_KP_0):
+                zoom = 1.0; map_pan[0] = map_pan[1] = 0.0          # recenter on YOU + reset zoom
+            # D-pad pans the map to explore away from your position (0 recenters).
+            # Only on the bare map — loot/cluster/data screens use the arrows themselves.
+            if not loot_screen and not cluster_screen and not data_screen and not prox_screen:
+                _ps = 12.0 / (9000.0 * max(0.0004, zoom))          # ~12 px/frame, in degrees (screen-constant)
+                if is_key_down(KEY_UP):    map_pan[0] += _ps
+                if is_key_down(KEY_DOWN):  map_pan[0] -= _ps
+                if is_key_down(KEY_LEFT):  map_pan[1] -= _ps / max(0.2, _last_coslat)
+                if is_key_down(KEY_RIGHT): map_pan[1] += _ps / max(0.2, _last_coslat)
+                map_pan[0] = max(-85.0, min(85.0, map_pan[0]))
+                map_pan[1] = max(-180.0, min(180.0, map_pan[1]))
         if prox_screen and is_key_pressed(KEY_O): bk.prox_toggle()
         if cluster_screen and not confirm_quit:    # cluster fleet screen
             if is_key_pressed(KEY_X):               # stop the fleet core (and close)
@@ -1679,7 +1692,11 @@ def main():
             clat = slat[len(slat) // 2]; clon = slon[len(slon) // 2]
         else:
             clat = clon = 0.0
+        _base_lat, _base_lon = clat, clon                 # your true position (avatar marker)
+        clat = max(-85.0, min(85.0, clat + map_pan[0]))   # D-pad pan shifts the VIEW center
+        clon = max(-180.0, min(180.0, clon + map_pan[1]))
         coslat = math.cos(math.radians(clat)) or 1.0
+        _last_coslat = coslat
         # clamp zoom-OUT so the world basemap always fills the map pane: stop the
         # moment a map edge (lon +-180 / lat +-85) reaches the matching pane edge,
         # so you can't pull out into empty void past the end of the map.
@@ -2125,20 +2142,25 @@ def main():
                 draw_circle_sector(Vector2(mcx, mcy), 300, a - i * 3.5, a - i * 3.5 + 5, 10, C(34, 211, 219, al))
             end_blend_mode()
 
-        # player avatar — map is centered on YOU
-        if not field: halo(mcx, mcy, TEAL, ((22, 24), (14, 34)))
-        draw_ring(Vector2(mcx, mcy), 15, 17, 0, 360, 40, C(34, 211, 219, 150))  # ground locus
+        # player avatar — at YOUR true position. With no D-pad pan that IS the screen
+        # centre; once you pan to explore, the avatar stays put on the world and the
+        # view slides, clamped to the pane edge so "you are here" never leaves the map.
+        _pax, _pay = geo2scr(_base_lat, _base_lon)
+        pax = int(max(mapx0 + 12, min(W - 12, _pax)))
+        pay = int(max(by0 + 12, min(by1 - 12, _pay)))
+        if not field: halo(pax, pay, TEAL, ((22, 24), (14, 34)))
+        draw_ring(Vector2(pax, pay), 15, 17, 0, 360, 40, C(34, 211, 219, 150))  # ground locus
         if player_tex is not None:
             ph = max(42.0, min(205.0, 70.0 * zoom))        # grows as you zoom in (~+20% at CLOSE)
             pw = ph * player_tex.width / player_tex.height
             draw_texture_pro(player_tex, Rectangle(0, 0, player_tex.width, player_tex.height),
-                             Rectangle(mcx - pw / 2, mcy - ph * 0.66, pw, ph), Vector2(0, 0), 0.0,
+                             Rectangle(pax - pw / 2, pay - ph * 0.66, pw, ph), Vector2(0, 0), 0.0,
                              WHITE if not field else C(210, 225, 235, 255))
         else:
-            draw_ring(Vector2(mcx, mcy), 22, 25, 0, 360, 48, C(220, 247, 255, 230))
-            draw_circle(mcx - 7, mcy - 2, 4, TEAL); draw_circle(mcx + 7, mcy - 2, 4, TEAL)
-            draw_rectangle(mcx - 1, mcy + 3, 2, 5, C(220, 247, 255, 200))
-            for dx in (-6, -2, 2, 6): draw_rectangle(mcx + dx - 1, mcy + 9, 2, 4, C(220, 247, 255, 200))
+            draw_ring(Vector2(pax, pay), 22, 25, 0, 360, 48, C(220, 247, 255, 230))
+            draw_circle(pax - 7, pay - 2, 4, TEAL); draw_circle(pax + 7, pay - 2, 4, TEAL)
+            draw_rectangle(pax - 1, pay + 3, 2, 5, C(220, 247, 255, 200))
+            for dx in (-6, -2, 2, 6): draw_rectangle(pax + dx - 1, pay + 9, 2, 4, C(220, 247, 255, 200))
 
         # ---- police lightbar (Emergency RF): left edge, between [TAB]MENU and the
         #      proximity pager. Grey while scanning; red/blue strobe on a detection. ----
@@ -2773,7 +2795,7 @@ def main():
         # key hints — tucked UNDER the brand + module chips (not crammed above
         # them), in TXT so they actually read against the bar
         hint = ("MENU   <-/-> tab   UP/DOWN item   ENTER run   TAB/ESC close"
-                if menu_open else "MAP  TAB=menu  C=cluster  ENTER=open  SPACE=hack  `=loot  P=creds  +/-=zoom")
+                if menu_open else "MAP  TAB=menu  C=cluster  ENTER=open  SPACE=hack  `=loot  P=creds  +/-=zoom  arrows=pan  0=home")
         text(mono, hint, 20, 44, 15, TXT)
 
         # target-input dialog (Deauth/SAE bssid+ch, BT Tracker mac)

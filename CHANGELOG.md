@@ -12,6 +12,27 @@ minor versions.
 
 ---
 
+## [0.10.4] — 2026-11-23
+
+### Changed
+- **Map place names are now English.** The offline ctOS world basemap had its
+  labels baked into the tiles in Polish (NIEMCY, FRANCJA, WARSZAWA, STANY
+  ZJEDNOCZONE...) while the rest of the UI is English. The basemap was re-rendered
+  from source with the map style's `text-field` switched from `name:pl` to
+  `name:en`, so it now reads GERMANY, FRANCE, WARSAW, UNITED STATES... in the same
+  dark ctOS style. (A handful of regions with only a non-Latin local name render
+  without a label — the bundled font carries Latin glyphs only, as before.)
+
+### Added
+- **Pan the map with the arrow keys.** The arrows now move the geographic map away
+  from your own position so you can explore the region or the whole world, the way
+  the original let you. `0` recenters on you and resets zoom. Your avatar is drawn
+  at its true position and clamped to the pane edge, so "you are here" stays on
+  screen once you pan away. Pan is suppressed while the loot / cluster / data /
+  proximity screens are open (they use the arrows themselves).
+
+---
+
 ## [0.10.3] — 2026-11-23
 
 ### Fixed

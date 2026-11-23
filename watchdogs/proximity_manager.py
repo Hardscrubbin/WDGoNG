@@ -36,7 +36,7 @@ ENABLED_FILE = os.path.join(_CFG_DIR, "prox_enabled")
 # Defaults pair with the badge smoke-test setup so it works out of the box; the
 # WDGWars portal would drop the real secret + resolution keys into ~/.watchdogs.
 DEFAULT_SECRET = "peer-jeden"
-DEFAULT_KNOWN = {"marauder": "badger-test"}
+DEFAULT_KNOWN = {"marauder": "badger-test", "zero": "wdgong-zero"}
 
 ADV_SECS = "3"
 SCAN_SECS = "6"
