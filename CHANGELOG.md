@@ -12,6 +12,23 @@ minor versions.
 
 ---
 
+## [0.10.6] — 2026-11-24
+
+### Changed
+- **Fuller offline basemap.** The world basemap now fills ~590 tiles that were blank
+  before (Ukraine / Belarus / Russia, the Balkans, parts of Asia and the Sahara
+  edge), all with English labels in the same dark ctOS style. A handful of z6 tiles
+  over non-Latin regions stay label-free (the bundled font is Latin-only). ~12 MB
+  larger as a result.
+
+### Added
+- **Device-type tag in proximity adverts.** Each device now advertises a small,
+  backward-compatible Service Data tag naming its hardware kind (uConsole), so a
+  fleet scanner can show the device model instead of a generic "WDG" peer. Older
+  parsers ignore the tag, so nothing else changes on air.
+
+---
+
 ## [0.10.5] — 2026-11-23
 
 ### Fixed

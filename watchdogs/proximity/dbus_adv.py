@@ -25,10 +25,11 @@ _COMPANY = int.from_bytes(prox_ble._COMPANY, "little")
 
 
 class _Advert(ServiceInterface):
-    def __init__(self, name, mfg_bytes):
+    def __init__(self, name, mfg_bytes, devtype=""):
         super().__init__("org.bluez.LEAdvertisement1")
         self._name = name
         self._mfg = bytes(mfg_bytes)
+        self._devtype = devtype
 
     @dbus_property(access=PropertyAccess.READ)
     def Type(self) -> "s":
@@ -43,6 +44,15 @@ class _Advert(ServiceInterface):
         return {_COMPANY: Variant("ay", self._mfg)}
 
     @dbus_property(access=PropertyAccess.READ)
+    def ServiceData(self) -> "a{sv}":
+        # WDGWars device-type tag (0xFFF0). On-air this is the same Service Data AD
+        # the raw-HCI side emits; old parsers ignore it, no wire regression.
+        if not self._devtype:
+            return {}
+        return {"0000fff0-0000-1000-8000-00805f9b34fb":
+                Variant("ay", self._devtype.encode("ascii", "ignore")[:1])}
+
+    @dbus_property(access=PropertyAccess.READ)
     def Includes(self) -> "as":
         return []
 
@@ -55,7 +65,7 @@ class _Advert(ServiceInterface):
         pass
 
 
-async def run(secret, seconds, adapter="hci0", log=print):
+async def run(secret, seconds, adapter="hci0", log=print, devtype="U"):
     bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
     obj_path = "/org/bluez/" + adapter
     introspect = await bus.introspect("org.bluez", obj_path)
@@ -81,7 +91,7 @@ async def run(secret, seconds, adapter="hci0", log=print):
                     except Exception:
                         pass
                     registered = False
-                adv = _Advert(name, prox_ble.fingerprint(ident))
+                adv = _Advert(name, prox_ble.fingerprint(ident), devtype)
                 bus.export(_ADV_PATH, adv)
                 await mgr.call_register_advertisement(_ADV_PATH, {})
                 registered = True
@@ -105,8 +115,9 @@ def main():
     ap.add_argument("--secret", default="peer-jeden")
     ap.add_argument("--adapter", default="hci0")
     ap.add_argument("--seconds", type=int, default=0)
+    ap.add_argument("--devtype", default="U")
     a = ap.parse_args()
-    asyncio.run(run(a.secret, a.seconds, a.adapter))
+    asyncio.run(run(a.secret, a.seconds, a.adapter, devtype=a.devtype))
 
 
 if __name__ == "__main__":
