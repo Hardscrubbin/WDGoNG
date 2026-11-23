@@ -8,6 +8,35 @@ minor versions.
 
 ---
 
+## [Unreleased]
+
+---
+
+## [0.10.3] — 2026-11-23
+
+### Fixed
+- **ADS-B radar no longer piles up stale aircraft.** Planes that flew out of range
+  used to stay stuck at the edge of the map forever instead of expiring, so over a
+  long SDR session they accumulated in memory and progressively lagged the UI until
+  the radar was toggled off and back on. The 60 s aircraft / 5 min sensor expiry
+  (`SDRManager.prune_stale()`) was implemented but never called; `poll()` now runs
+  it every frame — thread-safe against the live SBS reader (it snapshots before
+  deleting) and self-throttled to a real scan every few seconds — so out-of-range
+  aircraft and stale 433 MHz sensors drop off the radar on their own and the
+  aircraft counter stays honest, with no more toggling to clear them. Reported by a user.
+
+### Added
+- **Voltage-based low-battery warning.** The uConsole's AXP223 fuel gauge reports
+  `capacity%` unreliably (it can read ~100% while the cell is actually sagging
+  under load), so the HUD could sit at a green "96%" with no warning. The game now
+  reads `voltage_now` as the honest signal: it warns in the terminal when the pack
+  drops below ~3.45 V (hysteresis re-arms above 3.65 V), colours the HUD battery
+  red and shows the live voltage, and adds a BATT line to the Status screen. A low
+  pack is also what makes the uConsole speaker amp hiss/crackle, so the warning
+  lets you plug in before that starts.
+
+---
+
 ## [0.10.2] — 2026-11-22
 
 ### Fixed

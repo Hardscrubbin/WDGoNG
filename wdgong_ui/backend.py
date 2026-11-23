@@ -227,6 +227,8 @@ class Backend:
         self._loot_points_cache: list = []
         self._loot_points_ts = 0.0
         self.battery_pct = -1
+        self.batt_mv = 0                 # battery voltage (mV) - the honest low-batt signal
+        self._batt_warned = False        # hysteresis latch for the low-voltage warning
         self._bat_ts = 0.0
         self.mc_bubble = None           # (text, expire_time) for the radio toast
         self._notify_pulse = None       # one-shot sound cue consumed by the UI thread
@@ -918,6 +920,16 @@ class Backend:
                     etype, data = ev if isinstance(ev, tuple) and len(ev) == 2 else ("ev", ev)
                     self._term("[%s] %s" % (key.upper(), str(data)[:80]),
                                "warn" if etype == "error" else "raw")
+            except Exception:
+                pass
+        # Expire stale ADS-B aircraft / 433 sensors so a long SDR session does not
+        # pile them up and progressively lag the radar. prune_stale() is thread-safe
+        # and self-throttled, so calling it every poll() (per frame) is cheap and
+        # keeps the live radar + aircraft_total() honest without a view toggle.
+        _sdr = self._mgrs.get("sdr")
+        if _sdr is not None:
+            try:
+                _sdr.prune_stale()
             except Exception:
                 pass
         now = time.time()
@@ -4355,12 +4367,30 @@ class Backend:
             try:
                 for base in ("/sys/class/power_supply/axp20x-battery",
                              "/sys/class/power_supply/BAT0", "/sys/class/power_supply/battery"):
-                    p = Path(base) / "capacity"
-                    if p.is_file():
-                        self.battery_pct = int(p.read_text().strip()); break
+                    cap = Path(base) / "capacity"
+                    if cap.is_file():
+                        self.battery_pct = int(cap.read_text().strip())
+                        vp = Path(base) / "voltage_now"
+                        if vp.is_file():
+                            self.batt_mv = int(vp.read_text().strip()) // 1000   # uV -> mV
+                        break
             except Exception:
                 pass
+            # The AXP223 fuel gauge reports capacity% unreliably (it can read ~100%
+            # while the cell is actually sagging under load). Voltage is the honest
+            # signal, so warn on VOLTAGE, with hysteresis. A low pack is also exactly
+            # what makes the uConsole speaker amp hiss/crackle, so the hint says so.
+            if self.batt_mv:
+                if self.batt_mv < 3450 and not self._batt_warned:
+                    self._batt_warned = True
+                    self._term("[BATT] voltage low %.2fV - connect power (low batt also causes speaker crackle)"
+                               % (self.batt_mv / 1000.0), "warn")
+                elif self.batt_mv > 3650:
+                    self._batt_warned = False      # recovered / on charger -> re-arm
         return self.battery_pct
+
+    def battery_mv(self) -> int:
+        return self.batt_mv
 
     def loot_points(self) -> list:
         """All-sessions saved GPS points for the map clusters (cached 30s). Read-only
