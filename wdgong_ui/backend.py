@@ -2101,6 +2101,14 @@ class Backend:
 
     def stop_attacks(self) -> None:
         self.send("stop")
+        # A wardrive routed to the host Wi-Fi card runs its own scan thread; stop it too,
+        # the same way stop_wardrive_serial() does.
+        if self._host_wifi is not None:
+            try:
+                self._host_wifi.stop()
+            except Exception:
+                pass
+            self._host_wifi = None
         self._wardrive_serial = None
         if self.state:
             self.state.evil_twin_running = False
