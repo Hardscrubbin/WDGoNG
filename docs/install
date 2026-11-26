@@ -1,6 +1,6 @@
 #!/bin/bash
 # ESP32 Watch Dogs — one-line installer
-# curl -sL https://locosp.github.io/WatchDogsGo/install | sudo bash
+# curl -sL https://locosp.github.io/WDGoNG/install | sudo bash
 
 set -e
 
@@ -29,7 +29,9 @@ TARGET_USER="${SUDO_USER:-$(whoami)}"
 TARGET_HOME=$(getent passwd "$TARGET_USER" | cut -d: -f6)
 [ -n "$TARGET_HOME" ] || err "Cannot resolve home directory for user '$TARGET_USER'."
 
-INSTALL_DIR="${INSTALL_DIR:-$TARGET_HOME/python/WatchDogsGo}"
+INSTALL_DIR="${INSTALL_DIR:-$TARGET_HOME/python/WDGoNG}"
+EXPECT_REMOTE_HTTPS="https://github.com/LOCOSP/WDGoNG.git"
+EXPECT_REMOTE_SSH="git@github.com:LOCOSP/WDGoNG.git"
 
 echo -e "${CYAN}"
 echo "  ██╗    ██╗ █████╗ ████████╗ ██████╗██╗  ██╗"
@@ -46,17 +48,23 @@ echo ""
 
 echo -e "${GREEN}[1/3]${NC} Cloning repository..."
 if [ -d "$INSTALL_DIR/.git" ]; then
-    echo "  Directory exists — pulling latest..."
     cd "$INSTALL_DIR" || err "Cannot enter $INSTALL_DIR"
-    if ! sudo -u "$TARGET_USER" git pull --ff-only origin master; then
-        warn "git pull failed — continuing with existing copy"
+    # Only trust an existing checkout if it is OUR repo. Otherwise its setup.sh
+    # (which we run as root below) could be anything an attacker left there.
+    origin=$(sudo -u "$TARGET_USER" git remote get-url origin 2>/dev/null || echo "")
+    if [ "$origin" != "$EXPECT_REMOTE_HTTPS" ] && [ "$origin" != "$EXPECT_REMOTE_SSH" ]; then
+        err "$INSTALL_DIR is a git repo but its origin is '$origin', not the WDGoNG repo. Remove it or set INSTALL_DIR=... to a fresh path."
     fi
+    echo "  Directory exists — pulling latest..."
+    # A failed update must abort: never fall through to run a stale/untrusted setup.
+    sudo -u "$TARGET_USER" git pull --ff-only origin main \
+        || err "git pull failed — aborting so we do not run an outdated copy. Fix the repo and re-run."
 elif [ -d "$INSTALL_DIR" ]; then
     err "$INSTALL_DIR exists but is not a git repo. Remove it first or set INSTALL_DIR=..."
 else
     mkdir -p "$(dirname "$INSTALL_DIR")"
     chown "$TARGET_USER:$TARGET_USER" "$(dirname "$INSTALL_DIR")" 2>/dev/null || true
-    if ! sudo -u "$TARGET_USER" git clone https://github.com/LOCOSP/WatchDogsGo.git "$INSTALL_DIR"; then
+    if ! sudo -u "$TARGET_USER" git clone https://github.com/LOCOSP/WDGoNG.git "$INSTALL_DIR"; then
         err "git clone failed — check internet connection and try again"
     fi
     cd "$INSTALL_DIR" || err "Cannot enter $INSTALL_DIR after clone"
@@ -64,8 +72,17 @@ fi
 
 echo ""
 echo -e "${GREEN}[2/3]${NC} Running setup (this may take a few minutes)..."
-if ! bash setup.sh; then
-    err "setup.sh failed — see errors above. Re-run: cd $INSTALL_DIR && sudo bash setup.sh"
+cd "$INSTALL_DIR" || err "Cannot enter $INSTALL_DIR"
+# Integrity gate: the working tree must match exactly what git fetched. Any local
+# change (a planted setup.sh, a swapped file) means tampering — refuse to run it.
+if [ -n "$(sudo -u "$TARGET_USER" git status --porcelain 2>/dev/null)" ]; then
+    err "$INSTALL_DIR has local modifications — refusing to run setup. Run 'git reset --hard origin/main' there and retry."
+fi
+# Run setup AS THE TARGET USER, never as root: setup.sh uses sudo only for the
+# few system steps that need it, so a tampered copy can at most run with the
+# user's own rights, not root's. It also keeps .venv owned by the user.
+if ! sudo -u "$TARGET_USER" bash setup.sh; then
+    err "setup.sh failed — see errors above. Re-run: cd $INSTALL_DIR && bash setup.sh"
 fi
 
 echo ""

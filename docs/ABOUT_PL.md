@@ -68,8 +68,8 @@ Włączasz moduł SDR z menu i uruchamiasz:
 │     czujników (~) i Twoją pozycją      📻   │  ← Ikona LoRa radio
 │                                              │
 ├──────────────────────────────────────────────┤
-│ [LoRa] [public] WatchDogs_a3f1: cześć!       │  ← Terminal z logami
-│ [ADS-B] New: LOT523 alt:35000ft              │
+│ [LoRa] [public] WatchDogs_demo: cześć!       │  ← Terminal z logami
+│ [ADS-B] New: DEMO123 alt:35000ft              │
 │ [433] Bresser temp:22.5 humidity:65          │
 ├──────────────────────────────────────────────┤
 │ BLE:42 WiFi:128 HS:3 PWD:1 PWN:5  ADS-B:7   │  ← Statystyki sesji

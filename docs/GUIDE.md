@@ -18,10 +18,10 @@ Open-world hacking RPG for the ClockworkPi uConsole with real WiFi/BLE scanning,
 ### Quick Start
 
 ```bash
-git clone https://github.com/LOCOSP/esp32-watch-dogs.git
-cd esp32-watch-dogs
-./setup.sh          # creates venv, installs dependencies
-sudo ./run.sh       # auto-detects ESP32, starts game
+git clone https://github.com/LOCOSP/WDGoNG.git
+cd WDGoNG
+bash setup.sh             # creates venv, installs dependencies
+./wdgong_ui/run_ui.sh     # auto-detects ESP32, starts game (asks for sudo itself)
 ```
 
 ### Manual Port

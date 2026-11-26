@@ -72,12 +72,8 @@ pentest and signals-intelligence rig that plays like a game:
 
 | | |
 |---|---|
-| ![Live map](docs/screenshots/01-map.png) | ![Attack suite](docs/screenshots/02-attack-operator.png) |
-| **Live map** — your position and discovered networks as grid-clustered markers over the offline ctOS basemap, with a live terminal feed. | **ATTACK suite** — deauth, blackout, evil twin, SAE flood, Dragon Drain, MITM and more, behind the operator UI. |
 | ![EXTRAS hub](docs/screenshots/03-extras-hub.png) | ![Extra details](docs/screenshots/04-extras-detail.png) |
 | **EXTRAS hub** — browse reviewed, signed, always-sandboxed mini-apps; official LOCOSP extras shown in green, with ratings and search. | **Extra details** — icon, tags, the permissions it asks for, ratings, source and checksum, with the catalogue signature verified. |
-| ![Cluster fleet](docs/screenshots/05-cluster-fleet.png) | ![Loot database](docs/screenshots/06-loot.png) |
-| **Cluster fleet core** — the Marauder V8 node fleet: a coverage radar (each node at the centre of its channel slice), per-node health, and a join request you adopt with **[A]**. | **Loot database** — all-time totals, the per-session log journal, XP, hacker rank and badges. |
 
 ---
 
@@ -108,14 +104,14 @@ pentest and signals-intelligence rig that plays like a game:
 **One-liner** (uConsole / Raspberry Pi OS / Debian / Ubuntu):
 
 ```bash
-curl -sL https://locosp.github.io/WatchDogsGo/install-ng | sudo bash
+curl -sL https://locosp.github.io/WDGoNG/install | sudo bash
 ```
 
 **Or clone it yourself:**
 
 ```bash
-git clone https://github.com/LOCOSP/WDGoNG.git ~/python/WatchDogsGo-NG
-cd ~/python/WatchDogsGo-NG
+git clone https://github.com/LOCOSP/WDGoNG.git ~/python/WDGoNG
+cd ~/python/WDGoNG
 bash setup.sh          # creates the venv, installs everything (apt + pip), builds dump1090
 ```
 
@@ -187,7 +183,7 @@ can reach the repo over SSH even though the app runs as root.)
 **Manual:**
 
 ```bash
-cd ~/python/WatchDogsGo-NG && git pull --ff-only && ./wdgong_ui/run_ui.sh
+cd ~/python/WDGoNG && git pull --ff-only && ./wdgong_ui/run_ui.sh
 ```
 
 > Don't download a ZIP over the folder — that breaks the git checkout and leaves stale
@@ -211,6 +207,7 @@ for you.
 2. Copy the template and add the key:
    ```bash
    cp secrets.conf.example secrets.conf
+   chmod 600 secrets.conf
    nano secrets.conf          # set:  WARDRIVE_API_KEY=your-64-char-hex-key
    ```
 3. Restart the game. `secrets.conf` is **gitignored** — it never leaves your device and
@@ -516,10 +513,23 @@ sub-GHz manager — pin with `WDGO_PORT` if your setup is unusual.
 
 ## Data & privacy
 
-All your data lives under `loot/` and `secrets.conf`. **Both are gitignored and never leave
-your device** — updates (`git pull`) never touch them, and nothing is committed to the repo.
-Captured handshakes and credentials stay local; the game does not upload cracking material to
-WDGWars. Configure optional API keys in `secrets.conf`, or link WDGWars with `WDGWars Pair`.
+Your data lives under `loot/` and `secrets.conf`. Both are gitignored and never go into the
+game's repo — updates (`git pull`) never touch them.
+
+**Nothing leaves the device unless you configure it.** With no API keys and no linked
+account, everything stays local. What *can* leave, and exactly when:
+
+- **Wardriving data** — your networks and their positions (`wardriving.csv`) go to WiGLE
+  and/or WDGWars once you add keys and upload, **including automatically when a cluster
+  session stops**.
+- **Captured WPA handshakes** — go to the WPA-sec cracking service, but **only when you
+  run `Upload WPA-SEC` yourself**.
+- **Live location** — if you link WDGWars and have a GPS fix, the game sends your current
+  coordinates to the WDGWars map **about every 45 seconds** so others can see you, plus
+  ADS-B and MeshCore sightings during a sync.
+
+Captured credentials and any other loot stay on the device unless you upload the data
+above. Keep your keys private with `chmod 600 secrets.conf`.
 
 ---
 

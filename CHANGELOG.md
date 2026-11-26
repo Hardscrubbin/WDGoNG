@@ -14,1103 +14,320 @@ minor versions.
 
 ## [0.10.6] — 2026-11-24
 
+This release expands offline map coverage and identifies device models on the proximity radar.
+
 ### Changed
-- **Fuller offline basemap.** The world basemap now fills ~590 tiles that were blank
-  before (Ukraine / Belarus / Russia, the Balkans, parts of Asia and the Sahara
-  edge), all with English labels in the same dark ctOS style. A handful of z6 tiles
-  over non-Latin regions stay label-free (the bundled font is Latin-only). ~12 MB
-  larger as a result.
+
+- Filled approximately 590 blank basemap tiles in the dark ctOS style, adding about 12 MB. Tiles use English labels where the bundled Latin font supports them.
 
 ### Added
-- **Device-type tag in proximity adverts.** Each device now advertises a small,
-  backward-compatible Service Data tag naming its hardware kind (uConsole), so a
-  fleet scanner can show the device model instead of a generic "WDG" peer. Older
-  parsers ignore the tag, so nothing else changes on air.
 
----
+- Added a backward-compatible BLE Service Data tag for the hardware model. Fleet scanners can identify a uConsole, and older parsers ignore the tag.
 
 ## [0.10.5] — 2026-11-23
 
-### Fixed
-- **MeshCore adverts + messages are logged again.** `_mc_on_node` took 7 args but
-  the LoRa manager calls the node callback with 8 (it passes the pubkey); every
-  advert raised a `TypeError` swallowed by `except: pass`, so no MeshCore node ever
-  reached loot / the map / WDGWars. Incoming channel messages (and now DMs) were
-  also UI-only. Both now persist. (Reported by a user.)
-- **Proximity no longer outlives the game.** Quitting never stopped the proximity
-  BLE child processes, so they kept holding the controller and scanning/advertising
-  after exit (and fought the next launch for it). Quit now shuts them down, and the
-  radio supervisor kills a half-dead scan/advertise pair before respawning instead
-  of orphaning the survivor.
-- **WDGWars #general chat is saved.** Chat was kept only in memory and lost on exit;
-  it now persists to loot (incoming and your own messages). Delivery failures are
-  surfaced in the chat log instead of being silently dropped.
-- **CONTACTS panel is populated.** MeshCore nodes now fill the contacts store the
-  panel and counter read, which were always empty before.
-- **Memory no longer grows unbounded** on long sessions: the MeshCore log, the
-  WDGWars chat log and the Meshtastic message list are capped like the terminal was.
-- **ADS-B radar stops flickering / dropping contacts.** The aircraft, 433 MHz sensor
-  and emergency readers mutate their dicts on background threads; the UI now
-  snapshots them before iterating instead of racing the live dict.
+This release fixes session logging, BLE process cleanup and radar updates.
 
----
+### Fixed
+
+- Updated `_mc_on_node` to accept the public key passed by the LoRa manager. MeshCore adverts now reach loot, the map and WDGWars. Incoming channel messages and direct messages are saved to loot.
+- Stopped both proximity BLE child processes on exit. When one process fails, the radio supervisor stops its partner before restarting the pair.
+- Saved incoming and outgoing WDGWars `#general` messages to loot and added delivery failures to the chat log.
+- Populated the contacts store used by the CONTACTS panel and its counter with MeshCore nodes.
+- Capped the MeshCore log, WDGWars chat log and Meshtastic message list.
+- Updated the UI to take snapshots of the aircraft, 433 MHz sensor and emergency-reader dictionaries before iterating, preventing radar flicker and dropped contacts during background updates.
 
 ## [0.10.4] — 2026-11-23
 
+The offline map now supports panning and displays English place names.
+
 ### Changed
-- **Map place names are now English.** The offline ctOS world basemap had its
-  labels baked into the tiles in Polish (NIEMCY, FRANCJA, WARSZAWA, STANY
-  ZJEDNOCZONE...) while the rest of the UI is English. The basemap was re-rendered
-  from source with the map style's `text-field` switched from `name:pl` to
-  `name:en`, so it now reads GERMANY, FRANCE, WARSAW, UNITED STATES... in the same
-  dark ctOS style. (A handful of regions with only a non-Latin local name render
-  without a label — the bundled font carries Latin glyphs only, as before.)
+
+- Re-rendered the dark ctOS basemap with the map style's `text-field` set to `name:en`. Names outside the bundled font's Latin glyph set may appear without labels.
 
 ### Added
-- **Pan the map with the arrow keys.** The arrows now move the geographic map away
-  from your own position so you can explore the region or the whole world, the way
-  the original let you. `0` recenters on you and resets zoom. Your avatar is drawn
-  at its true position and clamped to the pane edge, so "you are here" stays on
-  screen once you pan away. Pan is suppressed while the loot / cluster / data /
-  proximity screens are open (they use the arrows themselves).
 
----
+- Added arrow-key panning and a `0` shortcut to recenter the map and reset zoom. The avatar tracks its geographic position and stays visible at the pane edge.
+- Reserved the arrow keys for navigation while the loot, cluster, data or proximity screen is open.
 
 ## [0.10.3] — 2026-11-23
 
+The radar expires stale contacts and the HUD displays low-battery warnings based on pack voltage.
+
 ### Fixed
-- **ADS-B radar no longer piles up stale aircraft.** Planes that flew out of range
-  used to stay stuck at the edge of the map forever instead of expiring, so over a
-  long SDR session they accumulated in memory and progressively lagged the UI until
-  the radar was toggled off and back on. The 60 s aircraft / 5 min sensor expiry
-  (`SDRManager.prune_stale()`) was implemented but never called; `poll()` now runs
-  it every frame — thread-safe against the live SBS reader (it snapshots before
-  deleting) and self-throttled to a real scan every few seconds — so out-of-range
-  aircraft and stale 433 MHz sensors drop off the radar on their own and the
-  aircraft counter stays honest, with no more toggling to clear them. Reported by a user.
+
+- `poll()` now calls `SDRManager.prune_stale()` each frame. The method checks a snapshot every few seconds and removes aircraft after 60 seconds and 433 MHz sensors after five minutes.
 
 ### Added
-- **Voltage-based low-battery warning.** The uConsole's AXP223 fuel gauge reports
-  `capacity%` unreliably (it can read ~100% while the cell is actually sagging
-  under load), so the HUD could sit at a green "96%" with no warning. The game now
-  reads `voltage_now` as the honest signal: it warns in the terminal when the pack
-  drops below ~3.45 V (hysteresis re-arms above 3.65 V), colours the HUD battery
-  red and shows the live voltage, and adds a BATT line to the Status screen. A low
-  pack is also what makes the uConsole speaker amp hiss/crackle, so the warning
-  lets you plug in before that starts.
 
----
+- Read `voltage_now` to trigger a terminal warning below approximately 3.45 V and re-arm it above 3.65 V. The HUD shows the live voltage and turns the battery indicator red on warning. The Status screen includes a BATT line.
 
 ## [0.10.2] — 2026-11-22
 
-### Fixed
-- **Setup no longer aborts on non-Debian / fresh systems.** The optional
-  `meshtasticd` step built a hardcoded `Debian_<VERSION_ID>` OBS repo path that
-  404s on Ubuntu (and any non-matching version), and under `set -e` that took the
-  whole install down. It is now distro-aware (Debian, Raspberry Pi OS, Raspbian,
-  Kali and Parrot map to the right Debian/Raspbian OBS repo; Ubuntu and DragonOS,
-  which have no repo there, skip cleanly) and fully non-fatal. `meshtasticd` is
-  optional and MeshCore works without it.
-- **Game window now fills the uConsole screen out of the box.** On the rotated DSI
-  panel the window came up as a tiny 720×720 square, because fullscreen is left to
-  the compositor and a fresh labwc had no rule for it. Setup now installs a labwc
-  window rule that auto-fullscreens the game (idempotent, backs up `rc.xml`).
-  Thanks to the community for pinning both of these down.
+Setup now handles distribution-specific radio packages and fullscreen startup on the uConsole.
 
----
+### Fixed
+
+- Made optional `meshtasticd` installation non-fatal. Setup selects the matching Debian or Raspbian repository for Debian, Raspberry Pi OS, Raspbian, Kali and Parrot, and skips the step on Ubuntu and DragonOS.
+- Added an idempotent labwc window rule that starts the game fullscreen on the rotated DSI panel. Setup backs up `rc.xml` before applying the rule.
 
 ## [0.10.1] — 2026-11-22
 
-### Fixed
-- **Bundled offline ctOS world basemap.** The ~28 MB `basemap.mbtiles` (WDG ctOS
-  Basemap, whole world, zoom 0–6) was excluded by a `.gitignore` rule, so it was
-  missing from the public repo and the v0.10.0 release — the map renderer shipped
-  but the map database did not, leaving players with only the radar/grid and no
-  map backdrop. The basemap is now tracked and bundled, so a fresh clone or an
-  in-game **Update** gets the world map. (Reported in
-  [#1](https://github.com/LOCOSP/WDGoNG/issues/1).) Note: the map still needs a
-  GPS fix to centre on you — without one it sits at `lat/lon 0,0`.
+Fresh clones and in-game updates now include the offline world map.
 
----
+### Fixed
+
+- Corrected the `.gitignore` exclusion and bundled `basemap.mbtiles` (approximately 28 MB, zoom levels 0–6). The map centers on the GPS position once a fix is available.
 
 ## [0.10.0] — 2026-11-20
 
-First **public release** of the Next-Gen (raylib) build, as
-[`LOCOSP/WDGoNG`](https://github.com/LOCOSP/WDGoNG). This entry consolidates the
-NG feature set that defines the release.
+This is the first public release of the raylib-based Next-Gen build.
 
 ### Added
-- **EXTRAS** — a sandboxed mini-app platform with a public, signed hub
-  ([`LOCOSP/WDGoNG-HUB`](https://locosp.github.io/WDGoNG-HUB/)): browse, install,
-  rate (banana / peel) and run reviewed extras; official LOCOSP extras shown in
-  green; catalogue signed offline with a hardware key.
-- **Cluster Wardrive** — turn the uConsole's XIAO into an ESP-NOW core for a
-  **Marauder V8** node fleet that sweeps the whole band in parallel; coverage
-  radar, per-node health, adopt-to-join.
-- **Unified LoRa Mesh** — MeshCore and native Meshtastic under one picker, shared
-  chat, node mapping on the map.
-- **Offline whole-world ctOS basemap** — bundled, renders under the markers
-  anywhere on Earth with no internet.
-- **RTL-SDR tools** — ADS-B radar with **track log + KML export**, 433 MHz
-  scanner, **433 Hunter** fox-hunt, **433 Capture** (raw `.cu8` + Flipper-ready
-  `.sub`), emergency-services radio.
-- **Host WiFi card support** (e.g. AC1200 / RTL8812AU) with a per-function
-  **radio matrix** (scan / wardrive / handshake / deauth / BLE → ESP32 / host / auto).
-- **WDGWars online** — pair by code, Chase the White Rabbit objectives, live
-  game-state HUD (rank, team, territory), stable per-device identity.
-- **Loot** — session-log journal (browse captures by date, preview files) and
-  one-file **Backup / Restore**.
-- **Proximity radar** — sense nearby WDGWars players over BLE, a shared protocol
-  across the WDGW firmware family with a rotating, privacy-preserving identity.
+
+- Added EXTRAS, a sandboxed mini-app platform for browsing, installing, rating and running reviewed extras. The hub catalogue is signed offline with a hardware key and displays official extras in green.
+- Added Cluster Wardrive with the uConsole XIAO as an ESP-NOW core for parallel scanning by Marauder V8 nodes, with node adoption, coverage radar and per-node health.
+- Combined MeshCore and native Meshtastic in one LoRa picker with shared chat and map markers.
+- Added an offline ctOS world basemap layer beneath map markers.
+- Added RTL-SDR tools for ADS-B tracking and KML export, 433 MHz scanning, 433 Hunter direction finding, 433 Capture recording (`.cu8` and Flipper-compatible `.sub`) and emergency-radio reception.
+- Added host WiFi card support and per-function ESP32, host or automatic radio selection for scanning, wardriving, handshakes, deauthentication and BLE.
+- Added WDGWars pairing by code, Chase the White Rabbit objectives, a HUD for rank, team and territory, and stable per-device identity.
+- Added a loot session journal with date browsing, file previews and single-file backup and restore.
+- Added BLE proximity radar using rotating identities and a protocol shared across the WDGW firmware family.
 
 ### Changed
-- **Relicensed to PolyForm Noncommercial 1.0.0** (source-available; noncommercial
-  use / modify / share; commercial use not permitted).
-- README overhaul; public landing leads with the NG one-line installer, the
-  feature set and hub links, with the classic OG build kept as a secondary option.
+
+- Relicensed the project under PolyForm Noncommercial 1.0.0.
+- Updated the README with the Next-Gen installer, features and hub links. The classic build remains available as a secondary option.
 
 ### Fixed
-- **GPS** — the AIO power rail is powered again on enable, so GPS can be toggled
-  from in-game as before; `ensure_gps` powers it where it's needed (wardrive / cluster).
-- **ADS-B count** — a session's aircraft total is now distinct ICAO codes, not
-  track-log rows.
-- **WDGWars upload** — JSON-contract handling: empty / HTML / login-redirect
-  responses are treated as "not yet", not as a hard JSON error.
+
+- Restored AIO rail power when enabling GPS. `ensure_gps` powers the rail for wardrive and cluster modes.
+- Counted distinct ICAO codes for the session aircraft total.
+- Treated empty responses, HTML and login redirects as pending WDGWars uploads.
 
 ## [0.9.14] — 2026-10-07
 
+Game updates are available from the SYSTEM menu.
+
 ### Added
-- **In-game updater** — `SYSTEM > Update Game`. The game checks GitHub on launch
-  and flags `[UPD] New game vX available` when the checkout's own upstream is
-  ahead; the Update Game screen then runs `git pull` for you and prompts a
-  restart. Your loot/saves are untouched (gitignored) — no manual file copying.
-- README **"Updating"** section (in-game / terminal / installer paths).
+
+- Added a launch-time update check and HUD notification. **Update Game** runs `git pull` and prompts for a restart. Loot and saves are excluded from Git.
+- Documented in-game, terminal and installer update paths in the README.
 
 ### Changed
-- The game version check is git-based — it fetches the checkout's own
-  `origin/<branch>` and compares commits, so it works on any branch/repo and
-  always matches what the updater actually pulls.
+
+- The version check fetches the checkout's own `origin/<branch>` and compares commits against the upstream used by the updater.
 
 ## [0.9.13] — 2026-06-04
 
-Companion to 0.9.12 — handles the transient HTTP 413 the same user
-(a user) saw on the larger of two sessions during a sync. Now
-documented and confirmed by the wdgwars admin as a WAF / LVE burst
-event on the shared-host LiteSpeed / Imunify360 layer, **not** a real
-payload size cap (admin tested clean uploads up to 32 MB).
-
-### Background
-
-The 413 response body started with `<!DOCTYPE HTML PUBLIC "-//W3C//DTD H…`
-— HTML 4 doctype = LiteSpeed origin error page, not the Cloudflare
-HTML 5 layout. So the rejection happened **before** the request hit the
-portal app, on the shared-hosting WAF for that specific IP / cadence.
-PHP `post_max_size` is 128 MB, `.htaccess` carries no `LimitRequestBody`,
-and the user successfully posted 15 payloads in a row in the same
-window with sizes 17–90 KB — confirming it's transient, not a fixed
-limit.
+Wardrive uploads can recover from transient HTTP 413 responses.
 
 ### Added
 
-- **`plugins/wardrive_upload.py`** — `HTTPError` handler now also
-  catches `e.code == 413`. Behaviour: exponential backoff retry with
-  delays `[1 s, 5 s, 30 s]` (max 3 attempts). Each retry re-signs a
-  fresh nonce (since the old one would be rejected as stale anyway
-  if the request did reach the app). On success the rest of the
-  upload pipeline runs as usual — totals, badge sync, `_mark_uploaded`
-  honouring the active-session rule from 0.9.6.
-- If all three retries still come back 413, the session is **left in
-  the pending queue** (no `_mark_uploaded`) so the next upload run
-  picks it up. Log line:
-  `HTTP 413 persisted through 3 retries — session left pending`.
-- If a retry returns a *different* HTTP status (e.g. 401 because the
-  user's key expired mid-batch), the loop bails out immediately
-  rather than burning the remaining backoffs on what is clearly not
-  a WAF issue.
-
-### Unchanged
-
-- The 429 (rate-limit) retry path is untouched — it still does a
-  single 5 s wait + one retry. Behaviour confirmed correct since 0.9.5;
-  no reason to bundle that change with this one.
-- Server-side, the admin will replace the bare LiteSpeed HTML 413
-  page with a JSON envelope via `ErrorDocument 413` in `.htaccess`,
-  so future incidents log as `HTTP 413: {"error":"upstream-413",…}`
-  instead of `HTTP 413: <!DOCTYPE HTML PUBLIC "-//W3C//DTD H…`. That
-  change is independent of this client release and lands when the
-  admin ships it.
-
----
+- Added up to three retries in `plugins/wardrive_upload.py`, after 1, 5 and 30 seconds. Each attempt signs a fresh nonce. A successful retry resumes totals, badge sync and normal `_mark_uploaded` handling.
+- Logged persistent HTTP 413 failures and kept the session in the pending queue for the next upload. A different HTTP status ends the 413 retry loop immediately.
 
 ## [0.9.12] — 2026-06-04
 
-Bugfix for the **Captured Passwords** screen in `LOOT DATABASE`. A user
-reported the count and the list were inflated with every Evil Twin /
-Evil Portal log line — `AP: Client connected`, `Portal: Client count =`,
-`Client connected to portal — switching to channel …` — instead of only
-actual POST credentials.
-
-In the screenshot the screen showed `Total: 14` for a session that had
-only **2** real `Received POST data: email=…&password=…` captures.
-
-### Root cause
-
-The full Evil Twin / Portal event stream is written to
-`<session>/evil_twin_capture.log` and `<session>/portal_passwords.log`
-for forensics. Two sites then treated those files as "list of
-passwords" without filtering:
-
-- `LootManager._scan_session_dir` counted every line in the log file
-  as one capture (`sum(1 for _ in open(...))`), so the all-time
-  `passwords` / `et_captures` totals over-reported by the ratio of
-  diagnostic events to credentials.
-- `WatchDogsGame._load_all_captures` (the data source behind the
-  Captured Passwords screen) iterated every line, ran
-  `_parse_post_fields()` on it, and **on no match still appended the
-  raw decoded line** as an entry — so connect/disconnect chatter
-  showed up under "CREDENTIALS".
+The Captured Passwords screen and loot totals filter diagnostic events out of credential records.
 
 ### Fixed
 
-- `watchdogs/loot_manager.py` — both counters (`passwords`,
-  `et_captures`) now only count lines containing `received post` or
-  `form submission` (case-insensitive). The log files themselves are
-  unchanged — they keep the full event timeline.
-- `watchdogs/app.py` — `_load_all_captures` drops the `else` branch
-  that was appending non-credential lines. Only lines that parse as
-  POST form data make it onto the Captured Passwords screen now.
-
-### Migration
-
-None needed. Both code paths re-scan session dirs on launch, so once
-the user `git pull`s and starts the game the inflated count corrects
-itself — the screenshot's `Total: 14` will become the real `Total: 2`
-without touching anything on disk.
-
----
+- Updated the `passwords` and `et_captures` counters in `watchdogs/loot_manager.py` to count lines containing `received post` or `form submission`, case-insensitively.
+- Restricted `_load_all_captures` in `watchdogs/app.py` to entries that parse as POST form data. Existing sessions are rescanned at launch without rewriting their logs.
 
 ## [0.9.11] — 2026-05-08
 
-Quality-of-life follow-up to 0.9.10. The Stadia Maps tile endpoint
-returns `HTTP 401 Unauthorized` for every request that doesn't carry
-a key, so a user who runs `SYSTEM > Download Map` without first
-adding `STADIA_API_KEY=…` to `secrets.conf` saw hundreds of
-`[MAP] 0% — ERR tile … HTTP Error 401: Unauthorized` lines in the
-terminal and no map — confusing first-run experience.
+Map downloads now check for a Stadia Maps API key before starting.
 
 ### Changed
 
-- **`watchdogs/app.py`** — `_start_map_download()` now preflights
-  `_load_stadia_key()` from `tile_manager`. If the key is empty the
-  download bails early with two clear messages instead of starting
-  the doomed worker thread:
-    ```
-    [MAP] No Stadia API key — add STADIA_API_KEY to secrets.conf
-    [MAP] Free signup: https://stadiamaps.com
-    ```
-- **`watchdogs/tile_manager.py`** — docstring on `download_tiles()`
-  and the throttle-sleep comment still referenced *"CartoDB Dark
-  Matter"* / *"CartoDB usage policy"* (leftover from before
-  a community contributor's PR #5 swapped the source). Now reads "Stadia Maps
-  Alidade Smooth Dark" / "polite to Stadia free tier" so a future
-  reader doesn't think there's a second tile provider in the code.
-
-No functional changes for users who already have a key configured —
-their download path is unchanged.
-
----
+- Updated `_start_map_download()` in `watchdogs/app.py` to call `_load_stadia_key()`. If the key is empty, the game displays setup instructions and skips the download worker.
+- Updated the `download_tiles()` docstring and throttling comment in `watchdogs/tile_manager.py` to identify the Stadia Maps Alidade Smooth Dark tile source.
 
 ## [0.9.10] — 2026-05-02
 
-Re-enabled offline map tile downloads, this time backed by Stadia Maps
-instead of the previously-disabled CartoDB Dark Matter source.
-Cherry-picked from a community contributor's PR #5 (`1719bbf`); each player decides
-individually whether to opt in by adding their own free API key.
+Offline tile downloads are available through Stadia Maps.
 
 ### Added
 
-- **`watchdogs/tile_manager.py`** — `_load_stadia_key()` reads
-  `STADIA_API_KEY` from `secrets.conf`, `_tile_url()` builds the
-  Alidade Smooth Dark tile URL with the key appended. User-Agent
-  string updated.
-- **`watchdogs/app.py`** — removed the WIP/disabled gate from the
-  `_dl_map` handler. `SYSTEM > Download Map` now actually downloads;
-  pressing `[m]` again cancels in-flight. Menu label dropped its
-  `(WIP)` suffix.
-- **`secrets.conf.example`** — documents `STADIA_API_KEY=…`. Without
-  it the Download Map entry tells the player to add one (free account
-  at stadiamaps.com, no bulk-download restrictions on the personal
-  tier).
-
-### Verified
-
-- 44 tiles downloaded over a location on the contributor's uConsole
-  CM4, zero errors, tiles render under the existing radar/markers
-  overlay (per PR #5 description).
-
----
+- Added `_load_stadia_key()` and updated `_tile_url()` in `watchdogs/tile_manager.py` to read `STADIA_API_KEY` from `secrets.conf` and construct Alidade Smooth Dark tile URLs. Updated the User-Agent.
+- Enabled the `_dl_map` handler in `watchdogs/app.py` and removed the WIP label from **Download Map**. Pressing `m` again cancels the active download.
+- Documented `STADIA_API_KEY` in `secrets.conf.example`.
 
 ## [0.9.9] — 2026-05-02
 
-Two community contributions cherry-picked from a community contributor's fork —
-the rest of his branch (handshake architecture change, AWUS packet
-sniffer, bridge scripts, whitelist.json) has been left out and will
-need separate review.
+The loot screen now tracks aircraft, and wardrive uploads allow longer processing times.
 
-### Added — Aircraft total on the loot screen
-*(commit `d283e66` from a community contributor, PR #4 target)*
+### Added
 
-- **`watchdogs/loot_manager.py`** — new
-  `save_adsb_aircraft(icao, callsign, lat, lon, alt_ft, speed_kt, heading)`
-  appends to `<session>/adsb_aircraft.csv` with header on first write,
-  dedup-by-ICAO within a session, fsync'd. Same pattern as the
-  existing `bt_devices` / `wardriving` writers.
-- **`_scan_session_dir`** counts `adsb_aircraft.csv` rows and
-  `_recalc_totals` / `_rebuild_db` carry the new `adsb` key so it
-  rolls up into all-time totals.
-- **`watchdogs/app.py`** — the `aircraft_new` event handler now also
-  calls `loot.save_adsb_aircraft(...)` for each unique ICAO seen,
-  capturing position/altitude/speed/heading.
-- **Loot screen** gains an "Aircraft" row in both the ALL-TIME column
-  (prefers server-side `_user_stats["aircraft"]` from the wardrive
-  plugin so the number matches what wdgwars.pl reports, falls back to
-  the local count) and the THIS SESSION column (live SDR aircraft
-  count).
+- Added `save_adsb_aircraft()` to `watchdogs/loot_manager.py`. It appends each distinct ICAO code once per session to `adsb_aircraft.csv`, writes the header on first use and syncs the file to disk. The format is compatible with `_parse_adsb` in the upload plugin.
+- Updated `_scan_session_dir`, `_recalc_totals` and `_rebuild_db` to include the `adsb` count in all-time totals.
+- Connected the `aircraft_new` event in `watchdogs/app.py` to the loot writer to record callsign, position, altitude, speed and heading.
+- Added an Aircraft row to both loot columns. ALL-TIME uses synced aircraft totals with a local fallback, and THIS SESSION uses the live SDR count.
 
-The CSV format `save_adsb_aircraft` writes is exactly what
-`plugins/wardrive_upload.py:_parse_adsb` already expects, so existing
-sessions get picked up automatically by the next upload.
+### Fixed
 
-### Fixed — Upload timeout false-failure
-*(commit `4e5ec75` from a community contributor, PR #6 target)*
-
-- **`plugins/wardrive_upload.py`** — bumped per-request timeout from
-  30 s to 90 s on both the main upload and the rate-limit retry. Large
-  ADS-B sessions could exceed 30 s server-side processing, so the
-  client got a `TimeoutError` on a request the server actually
-  accepted, then retried and the dedup layer correctly rejected the
-  duplicate — net effect was no progress.
-- **New `(TimeoutError, OSError)` handler** marks the session as
-  uploaded after a warning, instead of silently leaving it pending.
-  Safe in combination with 0.9.6's chokepoint (active session is
-  still skipped by `_mark_uploaded`) and 0.9.8's per-user
-  `aircraft_already_seen` dedup (any future re-upload only credits
-  genuinely new ICAOs).
-
-### Not merged from the same fork
-
-The submitted PRs (#4, #5, #6) all carried 8–10 commits from
-a community contributor's `main` branch beyond the target commit:
-
-- `feat: switch HS capture to airodump-ng …` — would replace ESP32
-  handshake capture with a host-side `airodump-ng` flow. Architecture
-  change, separate decision.
-- `feat: packet sniffer via AWUS036ACM wlan2, tcpdump monitor mode` —
-  new feature, needs its own design + UI review.
-- `Add XIAO auto-detect launcher, whitelist, and packet sniff bridge`
-  — bundled `whitelist.json` (a private MAC ignore list, not
-  appropriate for a shared repo) and an unsanitised bridge script.
-- `feat: AIO v1 uConsole Config …` — modifies code paths shared with
-  AIO v2 hardware; needs explicit AIO v1 vs v2 branching.
-- `fix: skip active session in _pending_sessions …` — duplicates the
-  fix already shipped as 0.9.6 (different code site, same intent).
-PRs #4, #5 and #6 closed with cherry-pick reference.
-
----
+- Increased the request timeout in `plugins/wardrive_upload.py` from 30 to 90 seconds for both uploads and rate-limit retries.
+- Added handling for `TimeoutError` and `OSError` that logs a warning and marks closed sessions as uploaded. The active session stays pending.
 
 ## [0.9.8] — 2026-04-26
 
-Surface the new `aircraft_already_seen` field that wdgwars.pl now
-returns alongside `aircraft_imported`. Companion to 0.9.6 — the server
-side of the same bug is fixed too: per-user `(user_id, icao)` dedup in
-the `user_aircraft_seen` table with `INSERT IGNORE`, so a re-uploaded
-session correctly credits aircraft that are new for that user.
+The upload log distinguishes newly imported aircraft from aircraft already seen.
 
-### Server-side fix (wdgwars.pl, by the portal admin)
+### Changed
 
-> Added `user_aircraft_seen` table (PRIMARY KEY user_id, icao) keyed
-> per-user, INSERT IGNORE on each ICAO during upload — `aircraft_imported`
-> now counts what's actually new for that user. Global
-> `maps_trackedaircraft` stays as the latest-position directory.
-> Plane Spotter / Plane Hunter / Sky Watcher badge counters all
-> switched to the new table; existing badge progress preserved via
-> best-effort backfill from prior `maps_trackedaircraft.uploaded_by_id`.
-
-### Client change
-
-- **`plugins/wardrive_upload.py`** reads the new `aircraft_already_seen`
-  key from the upload response. Successful upload log now shows
-  `+5 ac (3 seen)` instead of just `+5 ac`, so the user can see at a
-  glance how the dedup decided. No effect when the field is missing
-  (graceful default 0) — works against older server builds.
-
-### Reproducer
-
-Fresh user, blank slate:
-
-| step                                  | request ICAOs    | expected response                          |
-|---------------------------------------|------------------|--------------------------------------------|
-| 1. first upload                       | {A,B,C}          | `aircraft_imported: 3, aircraft_already_seen: 0` |
-| 2. same user, re-upload (active session)| {A,B,C,D,E,F,G,H}| `aircraft_imported: 5, aircraft_already_seen: 3` |
-
-Combined with 0.9.6 (active session never marked uploaded), the
-overnight ADS-B bug originally reported by the US user is fully
-addressed end-to-end.
-
----
+- Updated `plugins/wardrive_upload.py` to display `aircraft_already_seen` alongside `aircraft_imported` on success. A missing `aircraft_already_seen` field defaults to zero.
 
 ## [0.9.7] — 2026-04-26
 
-Accept any character device as a "serial port" so community PTY bridges
-work without patching the entry point.
-
-### Background
-
-GitHub issue [#1](https://github.com/LOCOSP/WatchDogsGo/issues/1)
-(a community contributor) — uConsole AIO v1 owners cannot get a real ESP32 + AIO v2
-on the same hardware, so the community wrote `wdg_wifi_bridge.py` which
-emulates the projectZero serial protocol on a PTY (`socat … PTY,link=/tmp/esp32-pty`)
-backed by the uConsole's built-in MT7921 (Wi-Fi) and BCM4345 (BLE)
-through `iw scan` and `bleak`. Game arguments only accepted `/dev/*`
-and `COM*` though, so `/tmp/esp32-pty` was getting parsed as a
-**loot path** instead and the game then started its normal ESP32
-auto-detect (which finds nothing).
+The game accepts serial bridges exposed as character devices outside `/dev/`.
 
 ### Fixed
 
-- **`watchdogs/__main__.py`** — argument detection moved into
-  `_looks_like_serial(path)` which keeps the old `/dev/*` and `COM*`
-  prefixes and additionally accepts any path that `os.stat()` reports
-  as a character device. PTYs created by `socat link=…` follow that
-  test, so `sudo ./run.sh /tmp/esp32-pty` now opens the bridge.
-
-### Compatibility / safety review
-
-- Argv is supplied by whoever launches the game (typically
-  `sudo ./run.sh`) — no new attack surface; the same user already
-  controlled `/dev/ttyUSB0` and any other path passed in.
-- All previously-handled argv shapes keep their existing behaviour:
-  - `/dev/ttyUSB0`, `COM3` → serial (unchanged)
-  - regular files (`/etc/hosts`), directories (`/tmp`), non-existent
-    paths, relative paths → loot path (unchanged)
-  - `/dev/null` → still serial because it lives under `/dev/` (was
-    already serial under the prefix rule)
-- New behaviour:
-  - existing character device outside `/dev/` (e.g. `/tmp/esp32-pty`
-    symlink to `/dev/pts/N`) → serial (was loot path → broken).
-
----
+- Added `_looks_like_serial(path)` in `watchdogs/__main__.py`. It recognizes `/dev/*`, `COM*` and paths that `os.stat()` resolves to character devices, including symlinks to PTYs.
 
 ## [0.9.6] — 2026-04-24
 
-Hotfix for a data-loss bug in `plugins/wardrive_upload.py` reported by
-a US user running ADS-B overnight:
-
-> If you stop wardriving during a session with active ADS-B, it's
-> marked as ready for upload. When a session is uploaded while still
-> active, any data written to it after the upload is lost because the
-> session gets marked as uploaded and never re-queued even though it
-> continued accumulating data overnight. […] 578 unique new ICAOs
-> seen after my upload — these are aircraft the server should have
-> counted as new but apparently didn't.
-
-The user's diagnosis was correct on the client side: as soon as
-`_upload_worker` got an HTTP 200 it added the session directory name
-to `_uploaded_sessions` and persisted that to
-`plugins/.wardrive_state.json`. The currently-recording session — the
-one ADS-B / GPS / MeshCore are still appending to — got the same
-treatment, so any rows written after the upload (overnight aircraft,
-late mesh adverts) silently fell out of the pending queue.
+Wardrive sync keeps the recording session eligible for upload as new data arrives.
 
 ### Fixed
 
-- **Active session is never marked as uploaded**. New helpers
-  `_active_session_name()` and `_mark_uploaded(session_dir)` in
-  `plugins/wardrive_upload.py` gate every place we used to call
-  `_uploaded_sessions.add(name)`. The active session keeps appearing
-  in `_pending_sessions()` until the game starts a fresh session
-  directory — at which point the now-stale session can finally be
-  marked done on the next upload.
-- The upload log explicitly tells the user when this happened:
-  `(active session — kept open for re-upload)` after a successful
-  upload, or `active, will re-check next upload` for a session that
-  was empty at upload time but might still receive data.
-
-### Not fixed (server-side)
-
-The user also flagged a second issue: after manually clearing the
-session from `_uploaded_sessions` and re-uploading, the server only
-credited the new MeshCore nodes and ignored 578 aircraft ICAOs that
-were genuinely first-seen that day. That dedup decision happens
-entirely on the wdgwars.pl side — there is nothing the game can do
-about it. Forwarded to the wdgwars admin separately.
-
----
+- Centralized completion tracking in `_active_session_name()` and `_mark_uploaded(session_dir)` in `plugins/wardrive_upload.py`. The active directory stays in `_pending_sessions()` until a new session starts.
+- Added log messages for successful and empty active-session uploads to indicate that the session will be checked again.
 
 ## [0.9.5] — 2026-04-24
 
-Runtime-selectable regional presets for the MeshCore radio. MeshCore
-upstream recently moved the default US/Canada preset from the legacy
-wide mode (`910.525 / BW250 / SF11 / CR5`) to narrow mode
-(`910.525 / BW62.5 / SF7 / CR5`), which is incompatible with the old
-preset — nodes running different settings physically cannot hear each
-other. Until now the game hard-coded EU/UK Narrow, so every US user
-was invisible to their local mesh.
+MeshCore radio presets can now be selected at runtime.
 
 ### Added
 
-- **`watchdogs/lora_manager.py` — `MESHCORE_PRESETS`** — six canonical
-  regional presets driving the SX1262:
-
-  | Key              | Label                                 | Freq       | BW     | SF | CR |
-  |------------------|---------------------------------------|------------|--------|----|----|
-  | `eu_uk_narrow`   | EU/UK Narrow (default)                | 869.618 MHz| 62.5 kHz| 8  | 5  |
-  | `eu_uk_default`  | EU/UK legacy wide                     | 869.525 MHz| 250 kHz | 11 | 5  |
-  | `us_ca_narrow`   | US/Canada Narrow (new upstream default)| 910.525 MHz| 62.5 kHz| 7  | 5  |
-  | `us_ca_default`  | US/Canada legacy wide                 | 910.525 MHz| 250 kHz | 11 | 5  |
-  | `anz_narrow`     | AU/NZ Narrow                          | 915.525 MHz| 62.5 kHz| 7  | 5  |
-  | `in_narrow`      | India Narrow                          | 865.525 MHz| 62.5 kHz| 7  | 5  |
-
-- **`ADDONS > MeshCore Region`** menu entry — opens an overlay picker
-  styled like the Evil Twin network picker (UP/DOWN + ENTER + ESC),
-  listing every preset with freq / BW / SF. Confirming persists the
-  choice to `~/.watchdogs_meshcore.json` and — if the radio is
-  currently running — stops and restarts the MeshCore sniffer on the
-  new settings immediately, without exiting to the menu.
+- Added six SX1262 regional presets to `MESHCORE_PRESETS` in `watchdogs/lora_manager.py`, with narrow and legacy wide modes.
+- Added the **MeshCore Region** picker to ADDONS. It displays frequency, bandwidth and spreading factor, saves the selection in `~/.watchdogs_meshcore.json` and restarts an active MeshCore sniffer with the selected settings.
 
 ### Changed
 
-- **`LoRaManager.start_meshcore(region=None)`** now takes an optional
-  region key instead of hardcoding the EU preset. Callers in `app.py`
-  (auto-start on boot, `_toggle_lora`) pass `self._mc_region`.
-- **`load_meshcore_config()` / `save_meshcore_config()`** round-trip a
-  new `"region"` field. Unknown/missing keys fall back to
-  `DEFAULT_MESHCORE_REGION = "eu_uk_narrow"` so existing installs keep
-  their current behaviour on upgrade.
-
-### Why this matters — reported by a US MeshCore user
-
-> Old settings were: req=910.525, bw=250, cr=5, sf=11
-> New settings are: req=910.525, bw=62.5, cr=5, sf=7
->
-> Based on the official map, the settings seem to be all over the
-> place. This is likely why I can't find anyone 😊
-
-Narrow mode concentrates TX energy and cuts airtime per packet, which
-lets more nodes share a channel with lower latency — but old-preset
-nodes simply cannot demodulate the new waveform. This release lets
-every user pick the preset that matches the mesh around them, right
-from the in-game menu, without editing JSON by hand.
-
----
+- Added the optional `region` argument to `LoRaManager.start_meshcore()`. Startup and `_toggle_lora` in `app.py` pass `self._mc_region`.
+- Updated `load_meshcore_config()` and `save_meshcore_config()` to persist the `region` field. Missing or unknown values use `DEFAULT_MESHCORE_REGION`.
 
 ## [0.9.4] — 2026-04-24
 
-Installer hardening after a user bug report: the Debian package
-`dump1090-mutability` that the installer pointed at has been an
-**archived upstream since 2018** — no RTL-SDR v4 support, no fixes.
-The ADS-B Radar add-on would bail with an unhelpful
-"Install: sudo apt install dump1090-mutability" message that then
-failed on newer Debian images where the package no longer exists.
-
-Full audit of every external binary the game shells out to
-(`shutil.which` / `subprocess`) found one more gap: `iw`, used by
-Dragon Drain and the serial bridge-interface check, was never in the
-apt list — it is usually preinstalled on Raspbian, but a user on a
-clean Debian image would silently lose those features.
+The installer now supplies missing ADS-B and wireless interface tools.
 
 ### Fixed
 
-- **`setup.sh`** now builds the actively-maintained
-  [FlightAware `dump1090` fork](https://github.com/flightaware/dump1090)
-  from source when `dump1090` is missing. Pulls `librtlsdr-dev`,
-  `pkg-config`, `build-essential`, `git` first, clones shallow, makes
-  with `-j$(nproc)`, installs to `/usr/local/bin/dump1090`. The binary
-  name stays `dump1090` so the game's existing detection
-  (`shutil.which("dump1090")`) and `dump1090 --net --quiet` subprocess
-  call keep working unchanged.
-- **`setup.sh`** adds `iw` to the apt dependency list so Dragon Drain
-  and interface bridging work on clean Debian/Ubuntu installs.
-- **`watchdogs/app.py`** no longer points the user at an archived apt
-  package when `dump1090` is missing. The in-game message now tells
-  them to rerun `./setup.sh` which builds the FA fork.
-- **`README.md`** system-dependency list rewritten accordingly, plus
-  adds the `python3-gi` / `gir1.2-glib-2.0` line that 0.9.2 needed
-  but never made it into the docs.
-
-### Audit summary
-
-Cross-checked `requirements.txt`, `setup.sh` and runtime `shutil.which`
-calls. All non-archived tools used by the game are covered:
-
-| Binary | Package | Installed by setup.sh |
-|--------|---------|----------------------|
-| `tcpdump` | `tcpdump` | yes |
-| `airmon-ng` / `aircrack-ng` | `aircrack-ng` | yes |
-| `iw` | `iw` | **yes (new in 0.9.4)** |
-| `rtl_433` | `rtl-433` | yes |
-| `bluetoothctl`, `btmgmt` | `bluez` | yes |
-| `hciconfig` | `bluez-tools` | yes |
-| `pactl` | `pulseaudio-utils` | yes |
-| `pinctrl` | `raspi-utils` | yes |
-| `dump1090` | built from FA source | **yes (new in 0.9.4)** |
-| `aiov2_ctl` | git clone + `./aiov2_ctl.py --install` | yes (RPi only) |
-
-`bdaddr` (used by `race_attack.py` for BLE MAC spoofing) is not in any
-standard Debian package and is left off the list — the module already
-falls back to `btmgmt public-addr` when it is missing.
-
----
+- Updated `setup.sh` to install build dependencies and build FlightAware's `dump1090` from source when the binary is missing. The build installs to `/usr/local/bin/dump1090`.
+- Added `iw` to the apt dependencies for Dragon Drain and interface bridging.
+- Updated `watchdogs/app.py` to direct installations missing `dump1090` to `./setup.sh`.
+- Updated the system dependencies in `README.md`, including `python3-gi` and `gir1.2-glib-2.0`.
 
 ## [0.9.3] — 2026-04-21
 
-Hotfix for `wdgwars.pl` upload flow. The server now sits behind Cloudflare
-with Bot Fight Mode enabled, which drops HTTP requests carrying a generic
-User-Agent (Python's urllib defaults to `Python-urllib/3.x`) with
-**HTTP 403 error code 1010**. Symptom reported by a user:
-
-```
-/api/me: HTTP 403 — Invalid signature
-Upload All: HTTP 403 error code: 1010    (×3 sessions)
-Done: 0/4 sessions
-```
+The WDGWars sync plugin now identifies the client consistently across HTTP requests.
 
 ### Fixed
 
-- **`plugins/wardrive_upload.py`** now sets an explicit User-Agent on
-  every request to the wardrive server. Format matches the spec the
-  wdgwars admin provided: `WatchDogsGo/<version> (<platform>; Python/<ver>)`
-  — e.g. `WatchDogsGo/0.9.3 (uConsole; Python/3.11)`. Platform is
-  `uConsole` on Linux (our target), real `platform.system()` value
-  elsewhere so dev boxes are distinguishable in server access logs.
-- **Centralised HTTP call site** as `_open(req, timeout)` wrapper that
-  injects `User-Agent` + `Accept: application/json` into every
-  `urllib.request.Request` before it reaches `urlopen`. All 6 request
-  sites in the plugin (POST `/api/upload/`, POST `/api/badges/`,
-  GET `/api/me`, auth-push POST + GET polling) now route through it,
-  so new endpoints can't accidentally ship without the header.
-
-### Verified
-
-- Live test against `https://wdgwars.pl/api/me` with the new UA and a
-  garbage `X-API-Key` returns **HTTP 401 "Missing or invalid API key"**
-  — the request reaches the application layer instead of being dropped
-  by Cloudflare. Exactly the "good case" the admin described.
-
-### What this does NOT fix
-
-- If `/api/me` still returns **403 "Invalid signature"** after pulling
-  this release, the user's API key is actually invalid on the server —
-  regenerate it on the wdgwars.pl profile page and re-enter via
-  `PLUGINS > Watch Dogs Go Wars Sync > Set API Key`.
-
----
+- Set an explicit User-Agent in `plugins/wardrive_upload.py` with the game version, platform and Python version. Linux builds identify the platform as uConsole, and other builds use `platform.system()`.
+- Routed all six HTTP request sites through `_open(req, timeout)`, which sets the User-Agent and `Accept: application/json` before calling `urlopen`.
 
 ## [0.9.2] — 2026-04-20
 
-Integration pass for the **LilyGO T-Watch Ultra** (PipBoy-3000 firmware).
-The watch firmware ≥ v0.4 hardened its BLE surface by requiring
-MITM-authenticated encryption on the Nordic UART Service characteristics
-— unauthenticated peers can no longer read notifications or issue
-commands. This release brings the game in line with that change and
-makes the first-pair flow work end-to-end on the uConsole.
+Watch pairing supports the authenticated BLE connection required by PipBoy-3000 firmware v0.4 and later on the LilyGO T-Watch Ultra.
 
 ### Added
 
-- **Explicit `bluetoothctl pair` pre-step** in
-  `watch_manager._async_connect`. Before opening the GATT session we
-  now check `bluetoothctl info <addr>` for `Paired: yes` / `Trusted: yes`
-  and, if either is missing, run `bluetoothctl pair <addr>` in a worker
-  thread with a 90-second timeout. That drives BlueZ into the pair
-  state cleanly and routes the passkey prompt through our existing
-  D-Bus Agent1 (`KeyboardDisplay` IO capability, `RequestPasskey` →
-  `provide_pin()` from the game UI). After success we mark the device
-  trusted so every subsequent connect is silent. The previous flow
-  relied on bleak's implicit Insufficient-Authentication retry, which
-  is flaky on BlueZ.
-- **`python3-gi` system dependency** installed + symlinked into the
-  game's venv by `setup.sh`. `gi.repository.GLib` is what the BlueZ
-  pairing agent's GLib main loop runs on; without it the agent
-  silent-failed and the new firmware's pair request had nowhere to go.
-  Same pattern we already use for `rpi-lgpio`: `apt install python3-gi
-  gir1.2-glib-2.0`, then symlink `/usr/lib/python3/dist-packages/gi` +
-  the `_gi*.so` / `_gi_cairo*.so` native extensions into
-  `.venv/lib/pythonX.Y/site-packages/`. It can't go in
-  `requirements.txt` because PyGObject via pip still needs
-  `libgirepository1.0-dev` + `gobject-introspection` at apt level, and
-  builds are fragile on the Raspberry Pi class targets.
-- **First-run preflight check** for `python3-gi` added to
-  `watchdogs/__main__.py` alongside `bleak` / `dbus-python`. If anyone
-  pulls just the code without running `setup.sh`, the boot screen now
-  shows `python3-gi — NOT INSTALLED (apt)` before the game launches.
+- Updated `watch_manager._async_connect` to check BlueZ pairing and trust before opening GATT. When pairing or trust is missing, a worker runs `bluetoothctl pair` with a 90-second timeout. The D-Bus agent routes passkey requests through `provide_pin()`, and successful pairing marks the watch as trusted.
+- Updated `setup.sh` to install `python3-gi` and `gir1.2-glib-2.0` and link the system GI package and native extensions into the game environment.
+- Added a `python3-gi` preflight check to `watchdogs/__main__.py`.
 
 ### Changed
 
-- **PIN entry overlay** in the Watch screen rewritten for the new flow:
-  240×80 → 320×112 with explicit wording ("Look at the watch — it shows
-  a 6-digit PIN. Type it here to complete pairing."), cyan PIN digits,
-  and the full key hint `[0-9] Type   [BKSP] Erase   [ENTER] Confirm`.
-  Centering redone for the Spleen 5x8 font (6 chars × 5 px).
+- Enlarged the Watch PIN overlay to 320×112, centered the six cyan PIN digits using Spleen 5×8 metrics, and added entry, erase and confirmation hints.
+- Updated `__version__` from `0.9.0` to `0.9.2`.
 
 ### Fixed
 
-- **Aircraft, ADS-B sensors and MeshCore nodes vanished at low zoom.**
-  The map render order was calling `_draw_aircraft / _draw_sensors /
-  _draw_markers` before `_draw_player`, and the player skull is a
-  ~9×9 sprite with a 10–12-pixel scan ring drawn at the map centre.
-  At low zoom every local source lands within that ring, so the plane
-  plus-shapes and node diamonds were simply being overdrawn by the
-  skull — visible only at CLOSE-UP zoom where quantization pushed
-  them outside the ring. Render order is now:
-  player → aircraft → sensors → markers → particles. Radar blips
-  now sit cleanly on top of the player.
-
-### Version
-
-- `__version__` bumped `0.9.0` → `0.9.2`. The 0.9.1 CHANGELOG entry
-  ships on top of the same `0.9.0` string because the version
-  constant wasn't updated at the time of that release; the next pypi-
-  style artefact is this one.
-
----
+- Changed map drawing order to player, aircraft, sensors, markers and particles. Nearby contacts remain visible over the player sprite at low zoom.
 
 ## [0.9.1] — 2026-04-19
 
-Readability, performance and data-loss protection. No new gameplay.
+This release updates text and map rendering and makes session data more resilient to power loss.
 
 ### Added
 
-#### Typography — Spleen 5x8 global font
-
-- **`assets/spleen-5x8.bdf`** — [Spleen](https://github.com/fcambus/spleen) by
-  Frederic Cambus, size 5x8, BSD-2-Clause, 76 KB BDF. Glyphs fit 95 ASCII
-  codepoints; Polish letters are transliterated by the MeshCore chat path
-  (`ą→a, ć→c, ę→e, ł→l, ń→n, ó→o, ś→s, ź→z, ż→z`, both cases) since BDF
-  is ASCII-only and our Pyxel build doesn't support Unicode fonts.
-- Loaded in `WatchDogsGame.__init__` as `self._font = pyxel.Font(path)`.
-  The built-in pyxel 4x6 font is kept only as a fallback when the BDF
-  fails to parse.
-- **Applied globally** by monkey-patching `pyxel.text` right after the
-  font loads:
-
-  ```python
-  _orig = pyxel.text
-  _f = self._font
-  def _patched_text(x, y, s, col, font=None, _o=_orig, _f=_f):
-      _o(x, y, s, col, font if font is not None else _f)
-  pyxel.text = _patched_text
-  ```
-
-  This covers ~370 call sites without touching them individually. Calls
-  that pass a font explicitly (e.g. the messenger's legacy 8x8 `_big_font`
-  for some labels) are untouched by the wrapper.
-- Size trade: visible terminal lines drop from ~22 (4x6) to ~12 (5x8),
-  but each line is actually legible on the uConsole panel.
-
-#### Map markers
-
-- **`_draw_markers` now branches on `MapMarker.type`**:
-  - `"meshcore"` → 5x5 cyan diamond (`pyxel.rect` + 4 cardinal `pset`s)
-    with 22/40 frames of an outer `circb` pulse ring at radius 6,
-    label in cyan from zoom ≥ 4.
-  - `"handshake"` → unchanged red skull shape (blinking ring at radius 4,
-    body `rect(-2,-1,5,4)`, crown `rect(-1,-3,3,2)`, warning-colored
-    centre pixel), label from zoom ≥ 5.
-- **`_draw_aircraft`** replaced the old 3-pixel arrow with a 6x5 plus
-  shape: `line(-3,0,+3,0)` wings, `pset(0,-2/-1/+1)` fuselage,
-  `pset(±1,+2)` tail fins, plus a 14/40 frames `circb` pulse at radius 5.
-  Altitude-colored (green < 5 kft, yellow < 20 kft, cyan above).
-  Result: planes and nodes stay visible on globe/continent views where
-  they previously collapsed to a single pixel under the coordinate
-  quantization.
-
-#### Power-cut resilience — event-driven fsync
-
-- New module-level helpers in `watchdogs/loot_manager.py`:
-  - `_fsync_file(fh)` — `fh.flush() + os.fsync(fh.fileno())`, wrapped
-    in `try/except (OSError, ValueError)` so a concurrently-closed
-    handle doesn't crash the call.
-  - `_sync_append(path, text, encoding, newline)` — append wrapper.
-  - `_sync_write(path, text, encoding, newline)` — truncating wrapper.
-- Applied to every save path that produces **unrecoverable** user data:
-
-  | File | Call site | Type |
-  |---|---|---|
-  | `portal_passwords.log` | `save_portal_event` | append |
-  | `evil_twin_capture.log` | `save_evil_twin_event` | append |
-  | `attacks.log` | `log_attack_event` | append |
-  | `wardriving.csv` | `save_wardriving_network` / `save_wardriving_bt` | append + rewrite (on dedupe) |
-  | `scan_results.csv` | `save_scan_results` | truncate |
-  | `sniffer_aps.csv` | `save_sniffer_aps` | truncate |
-  | `sniffer_probes.csv` | `save_sniffer_probes` | truncate |
-  | `meshcore_nodes.csv` | `save_meshcore_node` | append |
-  | `meshcore_messages.log` | `save_meshcore_message` | append |
-  | `bt_devices.csv` | `save_bt_device` | append |
-  | `bt_airtag.log` | `save_bt_airtag_event` | append |
-  | `handshakes/*.txt` | `_save_handshake_txt` | truncate |
-  | `handshakes/*.pcap` | `_save_pcap_stream` | binary truncate |
-  | `handshakes/*.hccapx` | `_save_pcap_stream` | binary truncate |
-  | `loot_db.json` | `_save_db` (tmp write before atomic rename) | truncate |
-
-- Motivation: `with open(path, 'a') as fh: fh.write(...)` only pushes
-  bytes into Python's FileIO buffer → `close()` flushes to the OS page
-  cache → the kernel writes to the block device whenever it feels like
-  it (on default ext4 / f2fs that's ~5–30 s via `dirty_writeback_centisecs`).
-  A hard power cut anywhere in that window loses the data. `os.fsync`
-  issues a FUA / cache-flush SCSI command and doesn't return until the
-  block device confirms the write is on stable media.
-- Cost on the uConsole's eMMC / Class 10 SD: ~5–20 ms per fsync call
-  under typical load. Cheap per event (a captured password fires once),
-  expensive per frame — so the serial log stream deliberately stays on
-  `flush()` only (see next section).
-
-#### Power-cut resilience — periodic background sync
-
-- `LootManager.__init__` starts a `threading.Thread(name="loot-backup",
-  daemon=True)` running `_periodic_backup_loop`.
-- `BACKUP_INTERVAL = 30` seconds. The loop sleeps in 1-second
-  increments so `close()` can flip `_backup_stop = True` and the thread
-  exits within 1 s instead of potentially 30 s — important because
-  `close()` then closes the serial log handle the thread was touching.
-- Each pass calls `flush_all()`:
-  1. `fsync` the open `serial_full.log` file handle (catches each ESP32
-     line that was `flush()`'d but not yet `fsync`'d).
-  2. `os.sync()` — a single syscall that schedules write-out of **all**
-     dirty pages across every mounted filesystem. Handles stragglers
-     from the tile cache, `loot_db.json` rewrites, plugin state files,
-     log rotation, anything else.
-- `os.sync()` latency on a Class 10 SD: 100 ms–2 s depending on
-  backpressure. Running it off the main thread keeps the 30 FPS game
-  loop untouched.
-- `LootManager.close()` now stops the thread, runs a final
-  `flush_all + os.sync`, writes the session summary (also fsync'd),
-  updates `loot_db.json`, and only then closes `self._serial_fh`.
+- Bundled the BSD-2-Clause Spleen 5×8 font at `assets/spleen-5x8.bdf`. `WatchDogsGame.__init__` loads it as the default for `pyxel.text`, preserves explicit font arguments and falls back to the built-in 4×6 font if loading fails. MeshCore chat transliterates Polish letters to ASCII.
+- Updated `_draw_markers` to render MeshCore nodes as pulsing cyan diamonds with labels from zoom 4 and handshake markers as red skulls with labels from zoom 5. `_draw_aircraft` uses pulsing, altitude-colored aircraft symbols.
+- Added `_fsync_file`, `_sync_append` and `_sync_write` in `watchdogs/loot_manager.py` to flush event logs, wardrive and scan CSVs, Bluetooth and MeshCore records, handshake files and loot database writes to disk.
+- Added a background thread in `LootManager` that runs `flush_all()` every 30 seconds to sync `serial_full.log` and call `os.sync()`. On shutdown, `close()` stops the thread, performs a final sync, writes the session summary and updates the loot database before closing the serial log.
 
 ### Changed
 
-#### UI relayout — from 4x6 to 5x8 metrics
-
-- Most touches are mechanical: `len(text) * 4` → `len(text) * 5`,
-  `y += 6` → `y += 8` (plus 1–2 px gap), row heights bumped 10 → 12
-  or 13, vertical text centering offsets `(h - 6) // 2` → `(h - 8) // 2`.
-- Selected concrete changes (file: `watchdogs/app.py`):
-
-  | Component | Before | After |
-  |---|---|---|
-  | HUD top badge box | `rectb(x, 3, len(label)*4+3, 9)` | `rectb(x, 2, len(label)*5+4, HUD_TOP-4)` |
-  | HUD bottom counter anchors | `4/52/110/146/190/240` | `4/60/125/170/220/270` |
-  | Messages stack spacing | `y -= 8` | `y -= 10` |
-  | Main menu tab height | 9 | 12 |
-  | Main menu item height (`IH`) | 10 | 13 |
-  | Input dialog field height | 16 | 20 |
-  | Input dialog box width | 280 | 320 |
-  | Confirm-quit dialog | 220x64 | 260x78 |
-  | GPS-wait dialog | 260x58 | 280x70 |
-  | Evil Twin picker | 480x220, rows 12 | 540x260, rows 14 |
-  | Portal picker | 360x180 | 420x220 |
-  | Cluster popup | 300 wide, rows 12 | 340 wide, rows 14 |
-  | Captured-data overlay | 500x200, rows 10 | 560x240, rows 12 |
-  | MeshCore toast | `len*6+60`, h=28 | `len*5+60`, h=32 |
-  | MeshCore chat bubble | `len*4+8`, h=10 | `len*5+8`, h=12 |
-  | Hacker-quip bubble | `len*4+16`, h=18 | `len*5+16`, h=20 |
-  | Flipper Zero row height | 12 | 13, ASCII line 7→9 |
-  | MITM row height | 10/12/14 mixed | 12 normalized |
-  | MITM log line height | 7 | 9 |
-  | Watch PIN overlay | 200x60 | 240x80 |
-  | Loot screen column rows | `y += 9` | `y += 10` (`ROW_H` constant) |
-  | Loot bottom list row height | 8 | 10 |
-  | Whitelist row height | 10 | 12 |
-  | Flash picker row height | 13 | 14 (`ROW_H` constant) |
-
-#### MeshCore Messenger font
-
-- `_draw_mc_screen` used to branch on `bf = self._big_font`, producing
-  two parallel code paths with `line_h = 10 if bf else 6` and
-  `char_w = 8 if bf else 4`. The branch is removed and the function
-  now writes plain `pyxel.text(x, y, s, col)` calls that pick up the
-  monkey-patched Spleen 5x8, with `line_h = 10`, `char_w = 5`.
-- `self._big_font` itself is still loaded from `assets/font_8x8.bdf`
-  for potential future use but is no longer passed to any `pyxel.text`
-  call in the codebase.
-
-### Performance
-
-- **Cluster color / radius cache.** `_update_clusters` (throttled to
-  ~1 Hz by `pyxel.frame_count - self._cluster_frame < 30` plus
-  zoom/center change detection) now writes two extra fields on each
-  cluster dict:
-
-  ```python
-  cl["color"] = C_HACK_CYAN if bt > wifi else C_SUCCESS
-  cl["radius"] = min(5 + cl["count"] // 3, 12)
-  ```
-
-  `_draw_loot_points` reads `cl["color"]` / `cl["radius"]` instead of
-  calling the former `_cluster_color(points)` per cluster per frame
-  (which iterated `points` twice counting types).
-- **Coastline bounding boxes.** `__init__` now builds
-  `self._coast_bounds = [(min_lat, max_lat, min_lon, max_lon,
-  antimerid), …]` one entry per segment in `COASTLINES`
-  (~100 segments, ~2200 points). `_draw_coastlines` reads the precomputed
-  bounds instead of rebuilding `lats = [p[0] for p in seg]` /
-  `min()`/`max()` every frame, and the previous double loop that
-  called `geo_to_screen` twice per point at zoom ≥ 5 (once for the
-  line pass, once for the `pset` pass) was collapsed into a single
-  pass.
-- **Terminal color cache.** `_term_add` now computes the display color
-  at append time via a new module-level `_color_for_terminal_line(line)`
-  (which still does the 11 `startswith` / `in` checks), and stores it
-  in a parallel `self._terminal_colors: list[int]` deque-trimmed to
-  500 like `self.terminal_lines`. `_draw_terminal` indexes
-  `colors_snap[i]` instead of re-evaluating all 11 checks per visible
-  line per frame.
-
-Combined, these three changes free roughly 10–20 ms of the 33 ms / 30 FPS
-budget on the uConsole, measurably smoother when the map holds many loot
-points and the terminal is actively streaming.
+- Adjusted HUD anchors, menu rows, dialogs, pickers, overlays and list spacing in `watchdogs/app.py` for the 5×8 font. The terminal now displays approximately 12 lines.
+- Updated `_draw_mc_screen` to use the global font with 5-pixel character widths and 10-pixel line spacing.
+- Cached cluster colors and radii in `_update_clusters` for reuse by `_draw_loot_points`.
+- Precomputed coastline segment bounds and combined line and point rendering into one projection pass in `_draw_coastlines`.
+- Updated `_term_add` to cache colors from `_color_for_terminal_line()` alongside the last 500 terminal lines for reuse by `_draw_terminal`.
 
 ### Fixed
 
-- **`loot_db.json` zero-byte window.** `_save_db` writes to
-  `loot_db.tmp` then calls `Path.replace` which is atomic on the same
-  filesystem, but the old code didn't fsync the tmp file before the
-  rename — a crash between those two calls left a zero-byte
-  `loot_db.json` next boot. The fix adds `_fsync_file(fh)` inside the
-  tmp-write's `with` block so the on-disk bytes are durable before the
-  rename flips the directory entry.
-- **MeshCore nodes and ADS-B aircraft rendered identically** to
-  handshake markers (a small red skull) because `_draw_markers` didn't
-  branch on `MapMarker.type`. They now have the distinct shapes
-  described in Added above.
-
----
+- Added `_fsync_file` to `_save_db` before `Path.replace` renames `loot_db.tmp` to `loot_db.json`, preventing a zero-byte database after an interrupted save.
+- Corrected map symbols for MeshCore nodes and ADS-B aircraft that previously appeared as handshake markers.
 
 ## [0.9.0] — 2026-04-12 (early access release)
 
-First public release. The core gameplay loop is complete and stable. Several
-advanced attacks are present in the menu but marked **(WIP)** because they
-need rework before they're safe for general users.
+The first public release includes the core gameplay loop, plugins and hardware integrations for the uConsole.
 
 ### Added
 
-- **Watch Dogs Go Wars Sync plugin** with full ecosystem integration:
-  - Upload wardriving sessions to community server (wdgwars.pl)
-  - Pull identity, stats and badges from `GET /api/me` after entering API key
-  - Auto-rename LoRa MeshCore node to `WDG_<username>` so other players see you
-  - Auto-validate API key, show "Invalid key" inline
-  - 8 game badges synchronized two-way with the server
-  - Level gate: locked until **Lv.6 WARDRIVER** (6000 XP) to avoid spam
-  - Obfuscated default endpoint (URL is built into the plugin, user only
-    enters their API key)
-- **JanOS Loot Import plugin** — migrate old JanOS session folders into the
-  game with automatic XP recalculation
-- **PipBoy Watch (T-Watch Ultra)** support over BLE (NUS) — read NFC,
-  send/receive LoRa MeshCore, control ESP32 attacks from the watch
-- **Bruce Firmware compatibility** — accepts wardriving CSVs uploaded from
-  any of 50+ ESP32 boards running Bruce
-- **First-run experience**:
-  - One-line installer (`curl -sL https://locosp.github.io/WatchDogsGo/install | sudo bash`)
-  - `setup.sh` auto-installs Python deps, SDL2, BlueZ, tcpdump, aircrack-ng,
-    rtl_433, dump1090, RPi5/CM5 GPIO library
-  - `secrets.conf.example` template with documented API keys
-  - Desktop launcher `.desktop` file
-  - First-launch warning if user is not in `dialout` group
-- **File logging** to `~/.watchdogs/last_run.log` (rotated to `previous_run.log`)
-  with full unhandled-exception capture for bug reports
-- **HUD shortcuts hint** — opening MeshCore Messenger now shows your unique
-  node name and the available `Ctrl+N`/`Ctrl+A`/`Ctrl+C`/`Ctrl+X` shortcuts
-- **Plugin system** that supports multiple plugins with overlay UIs
+- Added the Watch Dogs Go Wars Sync plugin for session uploads, identity and stats retrieval from `GET /api/me`, two-way sync for eight badges and MeshCore node naming. The plugin includes a built-in endpoint, validates the API key inline and unlocks at level 6 (6000 XP).
+- Added the JanOS Loot Import plugin with automatic XP recalculation for imported sessions.
+- Added BLE NUS support for the PipBoy Watch (T-Watch Ultra), including NFC reads, MeshCore messaging and ESP32 controls.
+- Added wardriving CSV compatibility with Bruce Firmware on more than 50 ESP32 boards.
+- Added a one-line installer, dependency installation via `setup.sh`, a `secrets.conf.example` template, a desktop launcher and a first-launch `dialout` group check.
+- Added unhandled-exception logging to `~/.watchdogs/last_run.log` with rotation to `previous_run.log`.
+- Added the node name and `Ctrl+N`, `Ctrl+A`, `Ctrl+C` and `Ctrl+X` shortcut hints to MeshCore Messenger.
+- Added support for multiple plugins with overlay interfaces.
 
 ### Changed
 
-- **Renamed all `janos_*` files and `JANOS_*` env vars to `watchdogs_*` /
-  `WDG_*`** with full backwards compatibility:
-  - `~/.janos_meshcore_key` → `~/.watchdogs_meshcore_key` (auto-migrated)
-  - `~/.janos_meshcore.json` → `~/.watchdogs_meshcore.json` (auto-migrated)
-  - `JANOS_WPASEC_KEY` / `JANOS_WIGLE_*` / `JANOS_GPS_*` / `JANOS_SOUND` —
-    both old and new names accepted on read; new name used when writing
-- **WiGLE CSV header** identifies as `appRelease=WatchDogsGo` (was `JanOS`)
-- **Auto-update URL** points to `esp32-watch-dogs` repository
-- **XIAO ESP32-C5 flash** uses `--before usb-reset` so firmware updates work
-  from the in-game menu without holding the BOOT button (the XIAO module
-  inside the uConsole has no accessible buttons)
-- **Plugin command dispatch** now encodes plugin index in the command key
-  (`_p_<idx>_<action>`) so multiple plugins with the same action name can
-  coexist
-- **MeshCore node names** are now generated from the user's Ed25519 public
-  key on first run (`WatchDogs_xxxxxxxx` — 8 hex chars), and replaced by
-  `WDG_<username>` after the wdgwars.pl API key is set
+- Renamed `janos_*` files and `JANOS_*` environment variables to `watchdogs_*` and `WDG_*`. MeshCore key and configuration files migrate automatically. Reads accept legacy variable names and writes use the new names.
+- Updated the WiGLE CSV header to `appRelease=WatchDogsGo` and pointed automatic updates at the public release repository.
+- Updated XIAO ESP32-C5 flashing to use `--before usb-reset` for in-game firmware updates.
+- Encoded the plugin index in dispatch keys using `_p_<idx>_<action>`.
+- Generated first-run MeshCore node names from eight hex characters of the Ed25519 public key. Configuring the WDGWars API key switches to the account-based node name.
+- Marked Download Map, BLE HID, HID Type, BlueDucky and RACE Attack as disabled in their menus.
 
 ### Fixed
 
-- **Upload 403** caused by missing `/api/upload/` path on the configured
-  server URL
-- **HTTPS on `wdgwars.pl`**: switched Traefik from TLS-ALPN-01 to HTTP-01
-  challenge, fixed `acme.json` permissions, removed stale failed cert
-  entries, fixed read-only SQLite database in the wardrive container
-- **CSV parser crash** on MeshCore node names containing commas
-  (e.g. `h,1Prz3`) — switched from `line.split(",")` to `csv.reader` and
-  `csv.writer` everywhere
-- **Every fresh user broadcasting as literal `WatchDogs`** on the LoRa
-  mesh — the buggy default never let the unique-name generator run
-- **Plugin overlays not opening** because `janos_import` and
-  `wardrive_upload` shared the action name `open_overlay` and dispatch
-  picked the first plugin alphabetically (which lacked a draw hook)
-- **`get_local_time(timeout=5000)` blocking the LVGL UI** for 5 s on the
-  PipBoy Watch firmware (handled in the watch repo, listed here for
-  visibility because it affected the in-game watch screen)
-
-### Disabled (work in progress)
-
-These features are present in the menu but show a "[FEATURE] disabled — work
-in progress" message when activated. They will return in a future update.
-
-- **Download Map** (SYSTEM tab) — needs new tile source and resume support
-- **BLE HID** (ADDONS tab) — Bluez D-Bus stack needs rewrite
-- **HID Type** (ADDONS tab) — depends on BLE HID
-- **BlueDucky** (ATTACK tab) — Bluetooth pairing race conditions
-- **RACE Attack** (ATTACK tab) — Airoha BT exploit needs hardening
-
-### Known limitations
-
-- **Linux only** (Debian / Raspberry Pi OS / Ubuntu). macOS, Windows,
-  Fedora, Alpine are not supported by the installer.
-- **Game requires sudo** for raw socket access, GPIO and serial ports.
-- **uConsole-first design** — runs on other Linux systems but the UI
-  is sized for the 640x360 uConsole display.
-- **Single-instance only** — running two copies of the game on the same
-  machine will fight over the ESP32 serial port.
-
----
+- Corrected the upload URL to include `/api/upload/`, resolving HTTP 403 on uploads.
+- Replaced comma splitting with `csv.reader` and `csv.writer` to handle commas in MeshCore node names.
+- Fixed fresh installs broadcasting the same default MeshCore node name.
+- Fixed overlay dispatch when `janos_import` and `wardrive_upload` both register `open_overlay`.
+- Fixed a five-second LVGL UI stall from `get_local_time(timeout=5000)` in the PipBoy Watch firmware.
 
 ## [0.x history] — pre-release
 
-The project evolved from **JanOS**, a terminal-based wardriving app for the
-ClockworkPi uConsole. The first commit of the Pyxel-based "Watch Dogs Go"
-frontend lands in early 2026; everything before that was JanOS work and is
-not tracked in this changelog.
+Watch Dogs Go evolved from the JanOS wardriving application for the ClockworkPi uConsole.
 
-The major pre-release milestones were:
+### Added
 
-- **JanOS → Watch Dogs Go rewrite** (Pyxel UI, RPG progression, badges)
-- **projectZero firmware** for ESP32-C5 (replaces JanOS firmware)
-- **PipBoy-3000 firmware** for T-Watch Ultra
-- **wdgwars.pl portal** (Django → PHP rewrite, gang warfare, anti-cheat,
-  WiGLE-compatible upload, badge system)
-- **Bruce Firmware integration** — pull request to upstream
-  `BruceDevices/firmware` adding native upload to wdgwars.pl
+- Added a Pyxel UI, RPG progression and badges in the Watch Dogs Go rewrite.
+- Added projectZero firmware for the ESP32-C5 and PipBoy-3000 firmware for the T-Watch Ultra.
+- Rewrote the WDGWars portal from Django to PHP, with gang warfare, anti-cheat, WiGLE-compatible uploads and badges.
+- Proposed native WDGWars upload support for Bruce Firmware.
 
-[0.9.13]: https://github.com/LOCOSP/WatchDogsGo/compare/v0.9.12...v0.9.13
-[0.9.12]: https://github.com/LOCOSP/WatchDogsGo/compare/v0.9.11...v0.9.12
-[0.9.11]: https://github.com/LOCOSP/WatchDogsGo/compare/v0.9.10...v0.9.11
-[0.9.10]: https://github.com/LOCOSP/WatchDogsGo/compare/v0.9.9...v0.9.10
-[0.9.9]: https://github.com/LOCOSP/WatchDogsGo/compare/v0.9.8...v0.9.9
-[0.9.8]: https://github.com/LOCOSP/WatchDogsGo/compare/v0.9.7...v0.9.8
-[0.9.7]: https://github.com/LOCOSP/WatchDogsGo/compare/v0.9.6...v0.9.7
-[0.9.6]: https://github.com/LOCOSP/WatchDogsGo/compare/v0.9.5...v0.9.6
-[0.9.5]: https://github.com/LOCOSP/WatchDogsGo/compare/v0.9.4...v0.9.5
-[0.9.4]: https://github.com/LOCOSP/WatchDogsGo/compare/v0.9.3...v0.9.4
-[0.9.3]: https://github.com/LOCOSP/WatchDogsGo/compare/v0.9.2...v0.9.3
-[0.9.2]: https://github.com/LOCOSP/WatchDogsGo/compare/v0.9.1...v0.9.2
-[0.9.1]: https://github.com/LOCOSP/WatchDogsGo/compare/v0.9.0...v0.9.1
-[0.9.0]: https://github.com/LOCOSP/WatchDogsGo/releases/tag/v0.9.0
+[0.9.13]: https://github.com/LOCOSP/WDGoNG/compare/v0.9.12...v0.9.13
+[0.9.12]: https://github.com/LOCOSP/WDGoNG/compare/v0.9.11...v0.9.12
+[0.9.11]: https://github.com/LOCOSP/WDGoNG/compare/v0.9.10...v0.9.11
+[0.9.10]: https://github.com/LOCOSP/WDGoNG/compare/v0.9.9...v0.9.10
+[0.9.9]: https://github.com/LOCOSP/WDGoNG/compare/v0.9.8...v0.9.9
+[0.9.8]: https://github.com/LOCOSP/WDGoNG/compare/v0.9.7...v0.9.8
+[0.9.7]: https://github.com/LOCOSP/WDGoNG/compare/v0.9.6...v0.9.7
+[0.9.6]: https://github.com/LOCOSP/WDGoNG/compare/v0.9.5...v0.9.6
+[0.9.5]: https://github.com/LOCOSP/WDGoNG/compare/v0.9.4...v0.9.5
+[0.9.4]: https://github.com/LOCOSP/WDGoNG/compare/v0.9.3...v0.9.4
+[0.9.3]: https://github.com/LOCOSP/WDGoNG/compare/v0.9.2...v0.9.3
+[0.9.2]: https://github.com/LOCOSP/WDGoNG/compare/v0.9.1...v0.9.2
+[0.9.1]: https://github.com/LOCOSP/WDGoNG/compare/v0.9.0...v0.9.1
+[0.9.0]: https://github.com/LOCOSP/WDGoNG/releases/tag/v0.9.0

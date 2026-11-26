@@ -21,8 +21,8 @@ def check(cond, msg):
 
 
 KEY = E.FleetKey(bytes(range(16)))
-NODE1 = "02:00:00:00:00:d4"
-JOINER = "02:00:00:00:00:99"
+NODE1 = "02:00:00:00:00:73"
+JOINER = "02:00:00:00:00:51"
 
 # synthetic node-side frame builders (self-contained, so importing a sibling
 # test does not run its checks as a side effect)

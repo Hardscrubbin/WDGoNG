@@ -81,7 +81,7 @@ MESHCORE_PRESETS: dict[str, tuple[int, int, int, int, str]] = {
                        "US/Canada Narrow (910.525 SF7 BW62.5)"),
     "us_ca_default":  (910_525_000, 11, 5, 250_000,
                        "US/Canada Default (910.525 SF11 BW250)"),
-    # SoCal mesh community preset, matching the T-Deck (wadamesh). (WatchDogsGo#16, a community contributor)
+    # SoCal mesh community preset, matching the T-Deck (wadamesh). (community preset)
     "us_927_narrow":  (927_875_000, 7,  5, 62_500,
                        "SoCal Mesh (927.875 SF7 BW62.5)"),
     "anz_narrow":     (915_525_000, 7,  5, 62_500,
@@ -102,7 +102,6 @@ def get_meshcore_preset(region: str | None):
 # MeshCore adverts flood the public mesh and land on community maps, so the advertised
 # position is snapped to a grid: the area shows, the exact fix never leaves the device.
 # 100_000 = 0.1 degree (~11 x 9 km at 50N); 1 = full precision, 10_000 = ~1 km.
-# (WatchDogsGo#16, a community contributor)
 ADVERT_LOCATION_GRID_UDEG = 100_000
 
 # MeshCore protocol constants
@@ -415,7 +414,7 @@ class LoRaManager:
         """Queue one physical RNode LoRa frame for TX (drained by the RX loop)."""
         self._tx_queue.put(bytes(frame))
 
-    # IQ 0x0736 bit2 for rnode. VERIFIED (WDGWars vademecum, T-Deck bring-up +
+    # IQ 0x0736 bit2 for rnode. VERIFIED (T-Deck bring-up +
     # gateway bridge): RNode uses STANDARD IQ = 0x0736 bit2 = 1 on bare SX126x,
     # re-applied after every SetPacketParams (the TX path clears it). LoRaRF's
     # convention clears bit2 for "standard", which is opposite — so we must force

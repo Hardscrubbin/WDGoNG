@@ -3,7 +3,7 @@
 Background client that talks to the WDGWars #general channel over Reticulum,
 using LXMF as the message layer. Phase 1 reaches the hub over TCP only — the
 wdgwars node has no LoRa radio, so the route to the hub exists solely over IP
-(see plan / internal-notes.md). A LoRa interface can be added later as a
+(see the project plan). A LoRa interface can be added later as a
 second RNS interface without touching this class.
 
 Mirrors the LoRaManager pattern: a daemon thread does the network work, app-set
@@ -32,30 +32,28 @@ except Exception:  # pragma: no cover - import guard
     LXMF = None  # type: ignore
     RNS_AVAILABLE = False
 
-# WDGWars network addresses (all lxmf.delivery, SINGLE) — verified on the live
-# node. See ~/Downloads/internal-notes.md.
+# WDGWars network addresses (all lxmf.delivery, SINGLE) — public Reticulum
+# destination hashes for the community server (like a server address, not a secret).
 HUB_HASH = bytes.fromhex("b29de9f746bd9d7a421ee84f3e0a6941")   # #general
 PROP_HASH = bytes.fromhex("90ab9d448f17f3a121dc0f1230af39be")  # propagation
-ECHO_HASH = bytes.fromhex("a9bb788a6a9723d709de2d5b321c2a7e")  # dev echo beacon
+ECHO_HASH = bytes.fromhex("a9bb788a6a9723d709de2d5b321c2a7e")  # echo beacon
 # LoRa-Relay: announces over LoRa every 20s, reposts to #general over TCP and
 # fans #general back to LoRa leaves. On LoRa we target THIS (not the hub) with
-# OPPORTUNISTIC — the only thing that works over slow LoRa (see WDGWars vademecum).
+# OPPORTUNISTIC — the only thing that works over slow LoRa.
 RELAY_HASH = bytes.fromhex("ddcd11421ae8b01d4fc58368c3038208")
 
 # Direct-mesh #general channel: a Reticulum GROUP destination shared by ALL
 # nodes (uConsole, gateway, T-Deck). Same identity → same channel hash; same
 # 64-byte key → mutual decryption. GROUP broadcasts 1 hop over LoRa, so a peer
 # in direct RF range receives it WITHOUT the gateway round-trip. Only usable
-# while lora_active (must own the radio to broadcast GROUP — see vademecum
-# lora-reticulum/mesh-group-czat-bezposredni-peer-to-peer.md).
+# while lora_active (must own the radio to broadcast GROUP).
 #
 # The shared identity+key are a SECRET (anyone holding them reads/injects the
 # channel) so they are NOT in the repo — loaded from a config file distributed
 # out-of-band to each node: {configdir}/group_creds, two hex lines
 #   line 1: RNS.Identity private key  (128 hex)
 #   line 2: GROUP symmetric key       (128 hex)
-# Absent file → direct-mesh disabled, relay-only (current behaviour). Channel
-# hash for the WDGWars creds: 0263685665b9d84fad33ac3bc8d110c4
+# Absent file → direct-mesh disabled, relay-only (current behaviour).
 GROUP_APP = "wdgwars"
 GROUP_ASPECT = "general"
 RX_PART_TTL_S = 300.0  # an open (k/n) set older than this is abandoned

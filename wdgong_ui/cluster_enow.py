@@ -12,7 +12,7 @@ assignment, join/release, GPS stamping. This module is the lowest layer of that 
 it turns raw ENOW payloads into typed objects and back, and nothing else. It has
 no I/O and no dependencies beyond the stdlib, so it is trivially unit-testable.
 
-Wire facts (verified against LOCOSP/wdgwars-marauder-c5 wdg_cluster.h, 2026-11):
+Wire facts (verified against the Marauder firmware's wdg_cluster.h, 2026-11):
   * little-endian, packed structs; the C sizes are reproduced exactly below.
   * every frame ends with a uint32 auth tag = FNV-1a over all preceding bytes,
     keyed by the 16-byte fleet key (JOIN_REQUEST / JOIN_GRANT use the public

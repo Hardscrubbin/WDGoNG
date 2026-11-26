@@ -37,8 +37,6 @@ def _locate_repo() -> Path | None:
     here = Path(__file__).resolve().parent          # wdgong_ui/
     cands += [
         here.parent,                                 # <repo>/ (wdgong_ui lives in repo)
-        Path.home() / "python" / "esp32-watch-dogs", # uConsole game repo
-        Path("/Users/user/python/esp32-watch-dogs"), # Mac dev repo
     ]
     for c in cands:
         try:
@@ -1655,7 +1653,7 @@ class Backend:
     # fleet (channel/role assignment, telemetry) and streams fleet records +
     # node telemetry + join events over serial. This host drives the UI, stamps
     # GPS, and persists. projectZero core-mode firmware is pending — protocol in
-    # the Vademecum cluster-serial thread; the line format here matches it.
+    # the cluster-serial protocol; the line format here matches it.
     # ------------------------------------------------------------------
     def start_cluster(self) -> None:
         self.ensure_session()
@@ -2014,7 +2012,7 @@ class Backend:
         import random
         import base64
         stop = self._cluster_sim_stop
-        # idx, MAC (from NODES.md), role, channel-slice (indices into _SIM_CHANNELS)
+        # idx, MAC (locally administered test MACs, not real devices), role, channel-slice
         fleet = [
             (0, "02:57:44:00:00:A1", "wifi", (0, 5)),
             (1, "02:57:44:00:00:B2", "wifi", (6, 13)),
@@ -2034,7 +2032,7 @@ class Backend:
                          "dropouts": 0, "last_gap": 0, "buffered": 0, "down_until": 0.0,
                          "alive": True, "joined": False, "active": False}
         ssids = ["FRITZ!Box 7590", "UPC1234567", "", "eduroam", "TP-LINK_A4F2",
-                 "iPhone (Ola)", "Orange_Swiatlowod", "", "Play_5G_88", "ESP_Portal",
+                 "iPhone (Demo)", "Orange_Swiatlowod", "", "Play_5G_88", "ESP_Portal",
                  "AndroidAP", "HUAWEI-B525", "", "Vectra-WiFi-2.4", "net_guest"]
         auths = ["[WPA2-PSK-CCMP]", "[WPA2-PSK-CCMP]", "[WPA3-SAE]",
                  "[WPA2-EAP]", "[OPEN]", "[WPA/WPA2]"]
@@ -2138,12 +2136,12 @@ class Backend:
                 time.sleep(1.4)
 
     def _ingest_cluster_line(self, line: str) -> None:
-        """Parse one cluster-serial line (see Vademecum cluster-serial thread)."""
+        """Parse one cluster-serial line (see the cluster-serial protocol)."""
         try:
             parts = line.rstrip("\r\n").split(",")
             kind = parts[0]
             if kind == "CNODE" and len(parts) >= 13:
-                # Final format (Vademecum cluster-serial Wpis 2), from the node's
+                # Final format (cluster-serial protocol), from the node's
                 # CLAIM: idx,MAC,role,claim_lo,claim_hi,cov,rec_min,buffered,temp_c,
                 # uptime_s,fw,dropped,dedup_pct,hops_min,dropouts,last_gap_s,
                 # assigned_by_core,serial_drop. Older firmware sends fewer -> default.
@@ -3504,7 +3502,7 @@ class Backend:
         m = self._mgrs.get("sdr")
         if m is not None and "keyhunt" in getattr(m, "mode", ""):
             m.keyhunt_reset_target()
-            self._term("[433] hunting the car key again (434.415 MHz)", "ok")
+            self._term("[433] hunting the car key again", "ok")
 
     def keyhunt_waterfall(self) -> tuple:
         """(rows, axis) for the Key Hunter waterfall — rows = list of dB-bin lists,
@@ -5050,6 +5048,12 @@ class Backend:
                         shutil.move(dst_path, bak)   # keep old data as undo
                     try:
                         shutil.move(src_path, dst_path)
+                        # The archive was extracted with the process umask, so force
+                        # private perms: secrets.conf 0600, the loot tree 0700.
+                        try:
+                            os.chmod(dst_path, 0o700 if is_dir else 0o600)
+                        except OSError:
+                            pass
                     except Exception:
                         if had:                      # restore the original on failure
                             if os.path.lexists(dst_path):

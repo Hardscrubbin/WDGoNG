@@ -6,7 +6,7 @@ the same system bus bleak already uses -- so this is the reliable path and ends 
 time-division hack.
 
 Standalone test:
-    sudo .venv/bin/python3 -m watchdogs.proximity.dbus_adv --secret REDACTED-SECRET --seconds 60
+    sudo .venv/bin/python3 -m watchdogs.proximity.dbus_adv --secret YOUR-SECRET --seconds 60
 Re-registers the advertisement every rotation slot so the LocalName stays current,
 and whenever the set of echoed peers changes.
 
@@ -171,7 +171,7 @@ async def run(secret, seconds, adapter="hci0", log=print, devtype="U", echo_file
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--secret", default="REDACTED-SECRET",
+    ap.add_argument("--secret", default="",
                     help="manual testing only; the game uses --secret-stdin")
     ap.add_argument("--secret-stdin", action="store_true", dest="secret_stdin",
                     help="read the secret from the first line of stdin (keeps it out of argv)")

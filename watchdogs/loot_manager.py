@@ -159,7 +159,17 @@ class LootManager:
 
         try:
             self._session.mkdir(parents=True, exist_ok=True)
+            # Private to this user: handshakes, credentials and GPS tracks live
+            # here, so no other local account may enter the session directory.
+            try:
+                os.chmod(self._session, 0o700)
+            except OSError:
+                pass
             (self._session / "handshakes").mkdir(exist_ok=True)
+            try:
+                os.chmod(self._session / "handshakes", 0o700)
+            except OSError:
+                pass
             self._handshake_dir = self._session / "handshakes"
             self._serial_fh = open(
                 self._session / "serial_full.log", "a", encoding="utf-8"

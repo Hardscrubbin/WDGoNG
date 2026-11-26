@@ -82,18 +82,18 @@ class Sensor433:
 # channel firing = a signal jumping above its OWN rolling baseline (a keyup);
 # the TETRA downlink is kept as a passive "network present" reference (base
 # carrier is always on). Verified live on-device: strong TETRA @~392 MHz,
-# fire @~148.63. Analog VHF plans sourced from czestotliwosci.pl.tl (Opolskie):
+# fire @~148.63. Analog VHF plans sourced from public PL frequency tables:
 #   fire PSP/OSP 148.66-149.34 | EMS/karetki 168.53-169.15 | police 172.575 +
-#   national 172.9/173.0 | municipal (SM) Opole 147.825 (147.74-148.95 range).
+#   national 172.9/173.0 | municipal (SM) ~147.825 (region-dependent) (147.74-148.95 range).
 # NOTE: the SM/analog-police plans may be dated -- calibrate against live logs.
 EMERGENCY_BANDS = [
     # name,        lo_hz,       hi_hz,       bin_hz, role,      thr_db
     # thr raised 7->10: a vehicle you'd actually SEE keys up strong (jump >10);
     # weak/distant blips you can't see anyway -> fewer false "emergency" alerts.
-    ("SM-VHF",     147_700_000, 148_450_000, 12_500, "vehicle", 10.0),  # straż miejska (Opole 147.825)
+    ("SM-VHF",     147_700_000, 148_450_000, 12_500, "vehicle", 10.0),  # straż miejska (~147.825 (region-dependent))
     ("STRAZ-VHF",  148_500_000, 149_400_000, 12_500, "vehicle", 10.0),  # straż pożarna PSP/OSP
     ("EMS-VHF",    168_500_000, 169_150_000, 12_500, "vehicle", 10.0),  # pogotowie / karetki
-    ("POL-VHF",    172_500_000, 173_100_000, 12_500, "vehicle", 10.0),  # policja analog (Opolskie 172.575)
+    ("POL-VHF",    172_500_000, 173_100_000, 12_500, "vehicle", 10.0),  # policja analog (172.575)
     ("TETRA-UL",   381_000_000, 383_000_000, 25_000, "vehicle", 10.0),  # wóz TETRA (uplink)
     ("TETRA-DL",   391_000_000, 393_000_000, 25_000, "network", 10.0),  # sieć TETRA (downlink ref)
 ]
@@ -101,7 +101,7 @@ EMERGENCY_BANDS = [
 # Fixed non-vehicle carriers to notch out (freq_hz, tolerance_hz). These sit on a
 # single frequency and key repeatedly for the WHOLE session (paging/telemetry/
 # base link) — a real passing vehicle is a brief one-off, not a persistent tone.
-# Confirmed over a full commute (2026-11-12 log): every false alert was one of
+# Confirmed over a testing: every false alert was one of
 # these two. Excluded from peak AND floor, so real signals elsewhere still fire.
 EMERGENCY_NOTCH = [
     (169_104_000, 30_000),   # EMS-band fixed carrier (not an ambulance)
@@ -125,14 +125,13 @@ KEY_HUNT_GAIN = "40"
 KEY_HUNT_INTEG = "0.08"     # short integration -> fast revisit for a moving hunt
 KEY_HUNT_THR = 18.0         # dB over the bin's OWN background to call a fob burst
 KEY_HUNT_HOT_SPAN = 25.0    # dB above the threshold mapped onto the 0..1 "hot" scale
-# Calibrated 2026-11-19 with real remotes, from 1 m and 5-10 m:
-#   car key (a car):  434.413-434.417 MHz, +30..41 dB at 5-10 m, core +-10 kHz
-#   gate remote:        ~434.11 MHz (434.098-434.122), +35..39 dB at 5-10 m
-# At 1 m a remote overloads the receiver and the whole band rises. Background: a
-# constant carrier at ~433.913 MHz, a drifting one around 434.26-434.37 MHz (10-18
-# dB) and neighbours' sensors at 433.83-433.96 MHz - hence a per-bin background
-# and a narrow target window instead of "strongest bin over the median floor".
-KEY_HUNT_TARGET = 434_415_000      # default: the car key (another remote: learn it with [L])
+# Calibrated with test remotes, from 1 m and 5-10 m:
+#   a car key fob:  somewhere in the ~434 MHz car-remote band, strong at 5-10 m
+#   another nearby fob:  elsewhere in the same band, strong at 5-10 m
+# At 1 m a remote overloads the receiver and the whole band rises. Other ISM-band
+# carriers and sensors usually sit nearby - hence a per-bin background and a narrow
+# target window instead of "strongest bin over the median floor".
+KEY_HUNT_TARGET = 434_400_000      # default: centre of the EU car-fob band (learn yours with [L])
 KEY_HUNT_TARGET_HALF = 20_000      # +- window around the fob centre
 KEY_HUNT_BG_ROWS = 20              # sweeps per bin kept for its background (median)
 KEY_HUNT_OVERLOAD = 10.0           # median rise of the WHOLE band = fob right next to you

@@ -54,3 +54,26 @@ portal_sync.log.1
 keyhunt_target.json
 radio.json
 graphify-out/
+
+# secret-guard local patterns (device-specific, never public)
+*.secret-patterns.local
+
+# --- More secrets / per-user state the game writes into the tree ---
+# backup & restore artefacts (can hold secrets.conf + chat identity)
+secrets.conf.*
+!secrets.conf.example
+*.pre-restore
+*.pre-restore/
+wdgo-backup-*.tar.gz
+# key / credential copies and imports
+*.key.bak*
+fleet.key.*
+fleet_import.txt
+group_creds
+.env
+.env.*
+# cracked-password potfiles and proximity secrets
+*.potfile
+prox.txt
+prox_known.json
+/.secrets.conf.*.tmp

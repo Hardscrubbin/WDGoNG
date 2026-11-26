@@ -50,9 +50,9 @@ def make_join_req(mac, key=KEY, fw_ver=31, rekey=0) -> bytes:
 def bline(mac, payload, rssi=-60, ch=6) -> E.BridgeFrame:
     return E.BridgeFrame(mac=mac, rssi=rssi, channel=ch, payload=payload)
 
-NODE1 = "02:00:00:00:00:d4"
-NODE2 = "02:00:00:00:00:bc"
-JOINER = "02:00:00:00:00:99"
+NODE1 = "02:00:00:00:00:73"
+NODE2 = "02:00:00:00:00:62"
+JOINER = "02:00:00:00:00:51"
 
 
 # --- parse_text_record ------------------------------------------------------

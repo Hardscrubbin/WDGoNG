@@ -5,7 +5,7 @@ advertise a rotating WDGWars identity AND listen for everyone else, so the
 question "do two different radios see one another" can be answered. Point this
 at the badge (running badge_peer.py) and watch both logs.
 
-    sudo python3 tools/uconsole_peer.py --secret REDACTED-SECRET --know marauder=REDACTED-SECRET
+    sudo python3 tools/uconsole_peer.py --secret YOUR-SECRET --know peer=THEIR-SECRET
 
 The maths, the trend and the meeting state machine all live in app/wdgwars/prox.py,
 which is the SAME file the badge runs -- so both sides land in the same rotation
@@ -313,8 +313,8 @@ def write_snapshot(path, engine, t, my_ident, slot):
                      "state": p.state, "trend": p.trend(),
                      "mutual": p.mutual(t), "bar": p.bar(20),
                      "dev": dt, "model": prox_ble.DEVTYPE_LABEL.get(dt, "")})
-    # Unresolved peers (strangers): one label format on every device (locosp
-    # 2026-11-25): <Model>-XXXX, or WDG-XXXX without a device type, XXXX = first
+    # Unresolved peers (strangers): one label format on every device:
+    # <Model>-XXXX, or WDG-XXXX without a device type, XXXX = first
     # 4 hex of the current ident (= the echo fingerprint). Idents rotate every
     # minute, so only peers heard in the last STRANGER_FRESH_MS are listed: the
     # old ident of a rotated peer must not linger as a second row.

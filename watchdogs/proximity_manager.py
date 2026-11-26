@@ -34,10 +34,12 @@ SECRET_FILE = os.path.join(_CFG_DIR, "prox_secret")
 KEYS_FILE = os.path.join(_CFG_DIR, "prox_keys.json")
 ENABLED_FILE = os.path.join(_CFG_DIR, "prox_enabled")
 
-# Defaults pair with the badge smoke-test setup so it works out of the box; the
-# WDGWars portal would drop the real secret + resolution keys into ~/.watchdogs.
-DEFAULT_SECRET = "REDACTED-SECRET"
-DEFAULT_KNOWN = {"marauder": "REDACTED-SECRET", "zero": "REDACTED-SECRET"}
+# No built-in shared secret: a hardcoded default would give every unconfigured
+# install the SAME predictable BLE identity. Instead each device mints its own
+# random secret on first use (unique identity), and the WDGWars portal can drop
+# the real team secret + resolution keys into ~/.watchdogs to join a team.
+INSTALL_SECRET_FILE = os.path.join(_CFG_DIR, "prox_install_secret")
+DEFAULT_KNOWN = {}
 
 ADV_SECS = "3"
 SCAN_SECS = "6"
@@ -60,13 +62,36 @@ class ProximityManager:
 
     # ── config ───────────────────────────────────────────────────────────
     def _secret(self):
+        # A configured team secret (from the portal) takes priority.
         try:
             s = open(SECRET_FILE).read().strip()
             if s:
                 return s
         except Exception:
             pass
-        return DEFAULT_SECRET
+        return self._install_secret()
+
+    @staticmethod
+    def _install_secret():
+        """This device's own random proximity secret: stable across runs but
+        UNIQUE per install, so an unconfigured device never broadcasts a shared,
+        predictable identity. Generated once and persisted 0600."""
+        try:
+            s = open(INSTALL_SECRET_FILE).read().strip()
+            if s:
+                return s
+        except Exception:
+            pass
+        import secrets as _secrets
+        s = _secrets.token_hex(16)
+        try:
+            os.makedirs(_CFG_DIR, exist_ok=True)
+            fd = os.open(INSTALL_SECRET_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                f.write(s)
+        except Exception:
+            pass
+        return s
 
     def _known(self):
         try:

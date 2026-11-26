@@ -20,14 +20,14 @@ The game plugin now sends 3 data types in one request:
 {
     "aircraft": [
         {
-            "icao": "471F6E",
-            "callsign": "LOT523",
-            "lat": 50.686500,
-            "lon": 18.120500,
-            "alt_ft": 18300,
-            "speed_kt": 354,
-            "heading": 98,
-            "first_seen": "1774857678",
+            "icao": "ABCDEF",
+            "callsign": "DEMO123",
+            "lat": 50.0000000,
+            "lon": 18.0000000,
+            "alt_ft": 12000,
+            "speed_kt": 300,
+            "heading": 90,
+            "first_seen": "1700000000",
             "type": "ADSB"
         }
     ]
@@ -50,13 +50,13 @@ Fields:
 {
     "meshcore_nodes": [
         {
-            "node_id": "48fab00f",
+            "node_id": "00000001",
             "node_type": "Client",
-            "name": "WatchDogs_a3f1",
-            "lat": 50.670000,
-            "lon": 17.905000,
-            "rssi": -48.0,
-            "first_seen": "2026-03-17T21:36:55",
+            "name": "WatchDogs_demo",
+            "lat": 50.0100000,
+            "lon": 17.0100000,
+            "rssi": -55.0,
+            "first_seen": "2026-01-01T12:00:00",
             "type": "MESHCORE"
         }
     ]
@@ -293,9 +293,9 @@ L.marker([lat, lng], {
 **ADS-B Aircraft:**
 ```html
 <div class="adsb-popup">
-    <div class="callsign">✈ LOT523</div>
-    <div>ICAO: 471F6E</div>
-    <div class="altitude">Alt: 18,300 ft</div>
+    <div class="callsign">✈ DEMO123</div>
+    <div>ICAO: ABCDEF</div>
+    <div class="altitude">Alt: 12,000 ft</div>
     <div>Speed: 354 kt | Heading: 98°</div>
 </div>
 ```
@@ -303,10 +303,10 @@ L.marker([lat, lng], {
 **MeshCore Node:**
 ```html
 <div class="mesh-popup">
-    <div class="node-name">◆ WatchDogs_a3f1</div>
+    <div class="node-name">◆ WatchDogs_demo</div>
     <div class="node-type">Type: Client</div>
     <div>RSSI: -48 dBm</div>
-    <div>ID: 48fab00f</div>
+    <div>ID: 00000001</div>
 </div>
 ```
 

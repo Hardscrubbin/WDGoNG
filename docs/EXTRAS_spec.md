@@ -10,9 +10,8 @@ the "login user" sketched in 7.3); the signed index uses OpenSSH signatures
 Validated on the uConsole: `extras/sim/test_sandbox.py` (42 checks incl. the kernel
 jail, as root) and `extras/sim/test_hub.py` (31 checks incl. forged-index attacks).
 
-Original header: design spec synthesised from a 4-member design council
-(architecture/loader, SDK/hardware API, security/sandbox, DX/packaging) plus the
-project owner's direction: *ultra-secure*, creator-only first, a GitHub-PR-curated
+Original header: design spec covering architecture/loader, SDK/hardware API,
+security/sandbox and DX/packaging, following the project owner's direction: *ultra-secure*, creator-only first, a GitHub-PR-curated
 hub later.
 
 A new **EXTRAS** menu category lists mini-apps dropped into a folder. Each is written

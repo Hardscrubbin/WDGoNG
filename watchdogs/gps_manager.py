@@ -205,7 +205,7 @@ class GpsManager:
         )
         # Some Raspberry Pi / CM4 boards expose the GPS UART (e.g. the AIO board's
         # built-in GPS) as the mini UART /dev/ttyS0. Probe only that one port, not
-        # ttyS*, so PCs with many ttyS ports don't wait 2 s each. (LOCOSP/WatchDogsGo#17)
+        # ttyS*, so PCs with many ttyS ports don't wait 2 s each. (community issue #17)
         if os.path.exists("/dev/ttyS0"):
             candidates.append("/dev/ttyS0")
         for path in candidates:

@@ -71,12 +71,12 @@ check(rep[4] == E.CORE_REPLY, "core_reply type byte")
 check(KEY.auth(rep[:-4]) == struct.unpack("<I", rep[-4:])[0], "core_reply auth")
 
 # --- RELEASE round-trip -----------------------------------------------------
-rel = E.build_release(KEY, "02:00:00:00:00:d4")
+rel = E.build_release(KEY, "02:00:00:00:00:73")
 check(len(rel) == 15, "release 15B")
 fr = E.decode(rel, KEY)
 check(fr.type == E.RELEASE and fr.authed, "release authed")
 _, _t, target, _a = E._S_RELEASE.unpack(rel)
-check(E.mac_to_str(target) == "02:00:00:00:00:d4", "release target mac")
+check(E.mac_to_str(target) == "02:00:00:00:00:73", "release target mac")
 
 # --- JOIN_GRANT (signed with the join secret, carries the fleet key) --------
 grant = E.build_join_grant(KEY)
@@ -99,7 +99,7 @@ check(jf.mac == "de:ad:be:ef:00:01" and jf.fw_ver == 29 and jf.rekey is True, "j
 def make_claim(tier_len, key, *, start=0, end=13, temp=None):
     """Synthesize a claim of the given frame length with a valid tag."""
     prefix = E._S_CLAIM_PREFIX.pack(
-        E.MAGIC, E.CLAIM, E.mac_to_bytes("02:00:00:00:00:bc"),
+        E.MAGIC, E.CLAIM, E.mac_to_bytes("02:00:00:00:00:62"),
         start, end, 2, 123, E.CLAIM_FROM_CORE, 40, 60, 7)
     body = bytearray(prefix)
     if tier_len >= E.CLAIM_LEN_SHA:
@@ -120,7 +120,7 @@ for tier in (E.CLAIM_LEN_BASE, E.CLAIM_LEN_SHA, E.CLAIM_LEN_VER,
     c = make_claim(tier, KEY)
     cf = E.decode(c, KEY)
     check(cf is not None and cf.type == E.CLAIM and cf.authed, f"claim@{tier} authed")
-    check(cf.mac == "02:00:00:00:00:bc" and cf.records == 123 and cf.rec_per_min == 60,
+    check(cf.mac == "02:00:00:00:00:62" and cf.records == 123 and cf.rec_per_min == 60,
           f"claim@{tier} base fields")
     check(cf.flags == E.CLAIM_FROM_CORE, f"claim@{tier} flags")
     # temp only present on the full frame
@@ -133,9 +133,9 @@ cble = make_claim(E.CLAIM_LEN_FULL, KEY, start=E.ROLE_BLE, end=E.ROLE_BLE)
 check(E.decode(cble, KEY).ble_role, "claim BLE role")
 
 # --- bridge line protocol ---------------------------------------------------
-line = f"ENOW,02:00:00:00:00:d4,-67,6,{adm.hex()}"
+line = f"ENOW,02:00:00:00:00:73,-67,6,{adm.hex()}"
 bf = E.parse_bridge_line(line)
-check(bf is not None and bf.mac == "02:00:00:00:00:d4" and bf.rssi == -67 and bf.channel == 6,
+check(bf is not None and bf.mac == "02:00:00:00:00:73" and bf.rssi == -67 and bf.channel == 6,
       "bridge line parse")
 check(bf.payload == adm, "bridge line payload")
 check(E.decode(bf.payload, KEY, src=bf.mac).type == E.ADMIN, "decode from bridge line")

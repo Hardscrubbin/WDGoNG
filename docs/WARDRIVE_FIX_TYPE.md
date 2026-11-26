@@ -17,8 +17,8 @@ POST `/api/upload/` payload (after HMAC decode):
             "auth": "WPA2",
             "channel": 6,
             "rssi": -45,
-            "lat": 52.2297700,
-            "lon": 21.0117800,
+            "lat": 52.2300000,
+            "lon": 21.0100000,
             "alt": 120.0,
             "type": "WIFI",           <-- THIS FIELD
             "first_seen": "2026-03-28 14:30:00"
@@ -29,8 +29,8 @@ POST `/api/upload/` payload (after HMAC decode):
             "auth": "BLE",
             "channel": 0,
             "rssi": -68,
-            "lat": 52.2298100,
-            "lon": 21.0118200,
+            "lat": 52.2301000,
+            "lon": 21.0101000,
             "alt": 120.0,
             "type": "BLE",            <-- THIS FIELD
             "first_seen": "2026-03-28 14:31:00"

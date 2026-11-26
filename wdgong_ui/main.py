@@ -578,14 +578,14 @@ def main():
         comp_screen = os.environ["WDGO_COMP"]
     if os.environ.get("WDGO_DATA"):          # test hook: captured data viewer
         data_screen = True
-        bk.captures.extend(["Email: bob@gmail.com | Password: hunter2",
+        bk.captures.extend(["Email: demo@example.invalid | Password: hunter2",
                             "User: admin | Password: r00t",
-                            "email: test@wp.pl | password: qwerty123"])
+                            "email: test@example.invalid | password: qwerty123"])
     if os.environ.get("WDGO_MSG"):           # test hook: open messenger w/ demo msgs
         msg_screen = os.environ["WDGO_MSG"]
-        demo = [("sys", "connecting to #general...", "sys"), ("in", "koko: siema z terenu", "in"),
-                ("out", "uConsole: elo, mam fix GPS", "out"), ("in", "[DM] r4ptor: widzisz mnie?", "dm"),
-                ("in", "koko: 5 nodeow w zasiegu", "in")]
+        demo = [("sys", "connecting to #general...", "sys"), ("in", "node_a: siema z terenu", "in"),
+                ("out", "uConsole: elo, mam fix GPS", "out"), ("in", "[DM] node_b: widzisz mnie?", "dm"),
+                ("in", "node_a: 5 nodeow w zasiegu", "in")]
         (bk.mc_log if msg_screen == "meshcore" else bk.wd_log).extend(demo)
 
     def new_worms(n):

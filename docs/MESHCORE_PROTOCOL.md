@@ -296,7 +296,7 @@ pubkey = privkey.public_key().public_bytes(
 
 ```python
 node_name = f"WatchDogs_{pubkey[:4].hex()}"
-# Example: WatchDogs_a3f1b2c0
+# Example: WatchDogs_0a1b
 ```
 
 Each device gets a unique name derived from its unique public key.

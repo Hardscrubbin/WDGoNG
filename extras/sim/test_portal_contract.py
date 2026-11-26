@@ -9,8 +9,8 @@ anti-cheat, idempotency and import - nothing reaches the game database, no XP.
 Run it before every release: the September bug (job status answered with a login
 page) would have failed here on day one.
 
-Checks, for the sync and the async path (contract of 2026-11-19, see Vademecum
-wdgwars-portal/kontrakt-upload-ng-odpowiedzi-json.md):
+Checks, for the sync and the async path (see the API contract in the docs
+):
   - every answer is JSON, carries X-WDGWars-Upload-API and Cache-Control: no-store
   - sync 200 says dry_run, saved:false, and counts what it received / found invalid
   - async 202 carries job_id, status, poll_url, retry_after; the job goes

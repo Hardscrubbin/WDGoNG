@@ -10,8 +10,8 @@ What it does (server contract):
   - Uploads per loot session: WiFi/BLE networks, ADS-B aircraft, MeshCore nodes.
   - Pulls badges the server grants back; GET /api/me for identity/stats.
 
-Two things are NG-specific (agreed with the portal agent on Vademecum, 2026-11-12):
-  - User-Agent product token is ``WatchDogsGo-NG`` so the portal can tell NG
+Two things are NG-specific (agreed with the portal side):
+  - User-Agent product token is ``WatchDogsGo-NG`` so the portal can tell this client
     traffic apart for the "uConsole Operators" ranking. Bench/dev runs on a Mac
     report ``(Darwin; raylib)`` and the server filters them out of the ranking.
   - The upload payload carries ``game_xp`` (declared-by-game XP, never ranked).
@@ -222,8 +222,7 @@ def _in_bounds(lat: float, lon: float) -> bool:
     return -90 <= lat <= 90 and -180 <= lon <= 180
 
 
-# --- Batching (parameters agreed with the portal agent, Vademecum
-# WDGWars-portal/upload-batching.md, 2026-11-13) -----------------------------
+# --- Batching (parameters agreed with the portal side,
 # A large session is split into batches so one request never trips the shared
 # host limits, and a partial failure only re-sends the missing batches.
 #   - 5000 records / batch: the server imports APs in chunks of 500, so a batch
@@ -1101,7 +1100,7 @@ class PortalSync:
         """GET /api/rabbits — list of white-rabbit tiles. [] on any error.
 
         The server computes distance/compass from its own 'area'; the caller
-        recomputes those from the device GPS instead (agent note, 2026-11-12).
+        recomputes those from the device GPS instead.
         """
         if not self.configured:
             return []
@@ -1147,19 +1146,24 @@ class PortalSync:
         if not found:
             out.append("%s=%s" % (key, value))
         text = "\n".join(out) + "\n"
-        tmp = path.with_name(path.name + ".tmp")
+        # Write via a fresh mkstemp file (random name, O_EXCL, 0600) in the same
+        # dir, then rename over. A fixed ".tmp" name could be pre-created as a
+        # symlink by anyone with write access to the dir, redirecting the write
+        # (secret leak / clobber); mkstemp never follows a planted link.
+        import tempfile
+        fd, tmpname = tempfile.mkstemp(dir=str(path.parent), prefix=".{}.".format(path.name), suffix=".tmp")
+        tmp = type(path)(tmpname)
         try:
-            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             try:
+                os.fchmod(fd, 0o600)
                 with os.fdopen(fd, "w", encoding="utf-8") as fh:
                     fh.write(text)
                     fh.flush()
                     os.fsync(fh.fileno())
-            finally:
-                try:
-                    os.chmod(tmp, 0o600)
-                except OSError:
-                    pass
+            except BaseException:
+                try: os.close(fd)
+                except OSError: pass
+                raise
             os.replace(tmp, path)
             try:
                 os.chmod(path, 0o600)

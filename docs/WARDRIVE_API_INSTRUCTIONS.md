@@ -79,8 +79,8 @@ def verify_upload(request):
             "auth": "WPA2",
             "channel": 6,
             "rssi": -45,
-            "lat": 52.2297700,
-            "lon": 21.0117800,
+            "lat": 52.2300000,
+            "lon": 21.0100000,
             "alt": 120.0,
             "type": "WIFI",
             "first_seen": "2026-03-28 14:30:00"
@@ -141,7 +141,7 @@ Game sends from Python requests, not browser. No CORS needed.
 The game's wardriving.csv is WiGLE format:
 ```
 MAC,SSID,AuthMode,FirstSeen,Channel,RSSI,CurrentLatitude,CurrentLongitude,AltitudeMeters,AccuracyMeters,Type
-AA:BB:CC:DD:EE:FF,MyNetwork,[WPA2-PSK],2026-03-28 14:30:00,6,-45,52.2297700,21.0117800,120.0,5.0,WIFI
+AA:BB:CC:DD:EE:FF,MyNetwork,[WPA2-PSK],2026-03-28 14:30:00,6,-45,52.2300000,21.0100000,120.0,5.0,WIFI
 ```
 
 The game plugin converts this to JSON before sending. Auth mode mapping:
