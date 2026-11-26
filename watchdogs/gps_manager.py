@@ -210,9 +210,18 @@ class GpsManager:
                 log.debug("GPS parse error: %s — %s", s.strip(), exc)
 
     def _parse(self, sentence: str) -> None:
-        # Strip checksum
+        # Check the checksum (XOR of everything between "$" and "*"), then strip it.
+        # A sentence damaged on the wire is dropped, not parsed.
         if "*" in sentence:
-            sentence = sentence.split("*")[0]
+            sentence, _, given = sentence.partition("*")
+            calc = 0
+            for ch in sentence[1:]:
+                calc ^= ord(ch)
+            try:
+                if int(given.strip()[:2], 16) != calc:
+                    return
+            except ValueError:
+                return
         parts = sentence.split(",")
         if len(parts) < 3:
             return
