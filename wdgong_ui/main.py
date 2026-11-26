@@ -1279,9 +1279,13 @@ def main():
             if is_key_pressed(KEY_ZERO) or is_key_pressed(KEY_KP_0):
                 zoom = 1.0; map_pan[0] = map_pan[1] = 0.0          # recenter on YOU + reset zoom
             # D-pad pans the map to explore away from your position (0 recenters).
-            # Only on the bare map — loot/cluster/data screens use the arrows themselves,
-            # and while a map cluster is selected/drilled the arrows navigate clusters.
+            # Only on the bare map. Every screen that consumes the arrows itself must
+            # be excluded, or the map pans behind it and ends up off-centre once it
+            # closes: loot/cluster/data/proximity, the radio, LoRa Mesh and Evil Twin
+            # pickers, and the LoRa Mesh chat (arrows scroll its backlog). While a map
+            # cluster is selected/drilled the arrows navigate clusters.
             if (not loot_screen and not cluster_screen and not data_screen and not prox_screen
+                    and not radio_screen and not mesh_screen and not et_screen and not msg_screen
                     and cluster_sel < 0 and not cluster_drill):
                 _ps = 12.0 / (9000.0 * max(0.0004, zoom))          # ~12 px/frame, in degrees (screen-constant)
                 if is_key_down(KEY_UP):    map_pan[0] += _ps
