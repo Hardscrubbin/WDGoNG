@@ -174,33 +174,6 @@ SURVIVAL_WIKI_URL = "http://localhost:8080"
 SURVIVAL_CTOS_MAP_URL = "http://localhost:8082/index.html"
 SURVIVAL_NAV_CMD = ["flatpak", "run", "app.organicmaps.desktop"]
 
-# Firmware update check
-FIRMWARE_RELEASE_URL = "https://api.github.com/repos/LOCOSP/projectZero/releases/latest"
-FLASH_BOARDS = {
-    "wroom": {
-        "label": "ESP32-C5 WROOM-1 (Dev Kit)",
-        "baud": 460800,
-        "before": "default-reset",
-        "bin_name": "projectZerobyLOCOSP.bin",
-        "offsets": {
-            "bootloader.bin": "0x2000",
-            "partition-table.bin": "0x8000",
-            "projectZerobyLOCOSP.bin": "0x20000",
-        },
-    },
-    "xiao": {
-        "label": "XIAO ESP32-C5 (Seeed Studio, USB-JTAG)",
-        "baud": 460800,
-        "before": "usb-reset",
-        "bin_name": "projectZerobyLOCOSP-xiao.bin",
-        "offsets": {
-            "bootloader.bin": "0x2000",
-            "partition-table.bin": "0x8000",
-            "projectZerobyLOCOSP-xiao.bin": "0x20000",
-        },
-    },
-}
-
 # Sound notifications (terminal bell)
 SOUND_ENABLED = _env("WDG_SOUND", "JANOS_SOUND", default="1") != "0"
 
