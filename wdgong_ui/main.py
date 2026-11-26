@@ -58,6 +58,7 @@ TABS = [
         ("1", "WiFi Wardrive",    "_wardrive_wifi",         "wardriving",   None),
         ("2", "BT Wardrive",      "_wardrive_bt",           "bt_scanning",  None),
         ("c", "Cluster Wardrive", "_cluster",               "_cluster_scr", None),
+        ("k", "Import Fleet Key", "_fleet_import",          "_fleet_import", None),
         ("3", "Pkt Sniffer",      "start_sniffer",          "sniffer",      None),
         ("4", "HS Capture",       "start_handshake",        "handshake",    None),
         ("5", "HS Capture no SD", "start_handshake_serial", "handshake",    None),
@@ -76,7 +77,7 @@ TABS = [
         ("j", "RACE Attack (WIP)","_race_wip",              "_race_wip",    None),
     ]),
     ("ADDONS", WARN, [
-        ("h", "BLE HID (WIP)",    "_bt_hid_wip",            "_bt_hid_wip",  None),
+        ("x", "BLE HID (WIP)",    "_bt_hid_wip",            "_bt_hid_wip",  None),
         ("i", "HID Type (WIP)",   "_bt_hid_wip",            "_bt_hid_wip",  None),
         ("9", "LoRa Mesh",        "_lora_mesh",             "_lora_mesh",   None),
         ("w", "WDGWars Chat",     "_wdgwars",               "wdgwars",      None),
@@ -152,6 +153,7 @@ MENU_DESC = {
     "WDGWars Chat": "WDGWars chat over Reticulum/LXMF (game).",
     "WDGWars Sync": "Upload wardriving/ADS-B/MeshCore loot to the WDGWars portal.",
     "Cluster Wardrive": "XIAO acts as ESP-NOW core for a node fleet; streams fleet hits over serial.",
+    "Import Fleet Key": "Join an existing fleet: type/paste a WDGFLEET1 line (from a Marauder/CZ/phone QR) or put it in ~/.wdgo/fleet_import.txt.",
     "WDGWars Pair": "Link this device to your WDGWars account with a short code (no 64-hex key typing).",
     "Flipper Zero": "Drive a Flipper Zero (SubGHz, NFC, Device Info).",
     "ADS-B Radar": "Track aircraft via RTL-SDR (dump1090, 1090 MHz).",
@@ -438,7 +440,10 @@ def main():
     quit_mode = "off"           # how to exit: 'off' | 'leave' | 'restore'
     confirm_restore = False     # Y/N guard before overwriting data on restore
     confirm_del = None          # session name pending delete in LOOT DB (Y/N), or None
+    _del_size_name = None       # cache: session whose on-disk size was measured for the dialog
+    _del_size_val = 0
     dep_prompt = None           # (item, module_key, module_label, addon_name) when an addon needs a module OFF
+    pending_restart = False     # OTA/restore asked to relaunch — deferred until no flash is running
     next_glitch, glitch_until = 2.0, 0.0
     frame = 0
     worms = [{"x": 0.0, "y": 0.0, "dir": (1, 0), "seg": 0.0, "trail": [], "life": 0, "init": False} for _ in MARKERS]
@@ -462,7 +467,8 @@ def main():
         sounds = {}
 
     running_keys = set()     # state_keys currently toggled on
-    input_mode = None        # pending target-input dialog: "bssid_ch" | "mac"
+    input_mode = None        # pending target-input dialog: "bssid_ch" | "mac" | "fleetkey"
+    fleet_import_msg = ("", True)   # last fleet-key import result shown in its dialog
     input_item = None        # the (hk,label,cmd,skey,inp) awaiting input
     input_buf = ""
     # Evil Twin / Evil Portal pickers
@@ -488,12 +494,17 @@ def main():
     loot_adsb_sel = -1       # highlighted aircraft (-1 = all equal)
     loot_adsb_cov = True     # show the receiver coverage outline
     loot_adsb_msg = ""       # last action (KML saved ...)
+    loot_adsb_busy = False   # background ADS-B load/export in flight (off the UI loop)
+    _adsb_job = {}           # worker handoff: {"kind","name","data","done"}
     loot_preview = None      # opened file preview dict (None = file list)
     loot_preview_scroll = 0  # scroll in the file preview
     loot_log_refresh_t = 0.0 # last journal auto-refresh time
     prox_screen = False      # WDGWARS proximity radar screen
     cluster_screen = False   # Cluster-core (node fleet) screen
     fleet_sel = 0            # selected row in the fleet health table (for manual channel pins)
+    cluster_overlay = None   # fleet-screen modal: None | "release" | "export" (QR of the fleet key)
+    cluster_release_mac = ""  # MAC captured when the Release prompt opened (release only THIS one)
+    mitm_ifaces_sig = None    # last-seen MITM interface list; a change forces re-confirm of the pick
     adsb_trails = {}         # icao -> recent [(lat,lon)] breadcrumb trail for the ADS-B radar
     pair_screen = False      # WDGWars device-pairing screen
     scan_modal = None        # scan-results modal: None | "wifi" | "ble" | "airtag"
@@ -613,7 +624,7 @@ def main():
 
     def dispatch(item):
         """Run a menu item like the OG _execute_item: toggle/stop/send."""
-        nonlocal scanning, input_mode, input_item
+        nonlocal scanning, input_mode, input_item, fleet_import_msg, pending_scan
         nonlocal et_screen, et_mode, et_sel, et_selected, portal_sel, portal_list, et_pending
         nonlocal msg_screen, msg_buf, msg_scroll, prox_screen, wl_screen, wl_sel, wl_scan
         nonlocal radio_screen, radio_sel
@@ -623,6 +634,12 @@ def main():
         nonlocal loot_screen, loot_detail, loot_preview, loot_log_sel, data_screen
         nonlocal mesh_screen, mesh_sel, mesh_pick
         hk, label, cmd, skey, inp = item
+        # During a flash, refuse any command that changes board power or resets it —
+        # cutting USB power or rebooting mid-write bricks the run.
+        if bk.flash_busy() and cmd in ("_toggle_usb", "_toggle_gps", "_toggle_lora",
+                                       "_toggle_sdr", "_reboot_esp32", "restart"):
+            bk.set_status("flashing ESP32 - power/reset locked until it finishes")
+            return True
         # LoRa Mesh = unified picker (MeshCore/Meshtastic -> region/band -> preset -> chat)
         if cmd == "_lora_mesh":
             mesh_screen = True; mesh_sel = 0
@@ -635,6 +652,9 @@ def main():
         # Captured Data = the captured-credentials viewer (also [P] on the map)
         if cmd == "_captured_data":
             data_screen = True; return True
+        # Import Fleet Key = text dialog for a WDGFLEET1 line (uConsole has no camera)
+        if cmd == "_fleet_import":
+            input_mode = "fleetkey"; input_item = item; fleet_import_msg = ("", True); return True
         # companion screens (Flipper / SubGHz / MITM / Watch / Update Game)
         _COMP = {"_flipper": "flipper", "_subghz": "subghz", "_mitm": "mitm",
                  "_watch_connect": "watch", "_update_game": "gameupd"}
@@ -723,6 +743,7 @@ def main():
         # STOP ALL
         if cmd == "stop" or skey == "_stop_all":
             bk.stop_attacks(); running_keys.clear(); scanning = False
+            pending_scan = None                 # cancel any awaited scan dialog
             bk.set_wardrive(None)
             bk.set_mode("idle"); bk.set_status("stopped all"); return
         # Evil Twin: pick target network(s) -> portal -> serial sequence
@@ -1110,9 +1131,11 @@ def main():
         b.key_names = (list(_EKEYS.keys()) + [chr(_c) for _c in range(ord("a"), ord("z") + 1)]
                        + [str(_d) for _d in range(10)])
         b.gps = _bgps
-        b.loot_networks = lambda: [{"ssid": getattr(n, "ssid", ""), "bssid": getattr(n, "bssid", ""),
-                                    "channel": getattr(n, "channel", 0)} for n in (bk.networks() or [])]
-        b.loot_counts = lambda: {"networks": len(bk.networks() or [])}
+        def _bnets(limit=None):
+            return [{"ssid": getattr(n, "ssid", ""), "bssid": getattr(n, "bssid", ""),
+                     "channel": getattr(n, "channel", 0)} for n in (bk.networks(limit=limit) or [])]
+        b.loot_networks = _bnets
+        b.loot_counts = lambda: {"networks": bk.network_count()}
         b.log = lambda msg, level="info": bk._term(
             "[%s] %s" % (meta.id, msg),
             {"info": "raw", "ok": "ok", "warn": "warn", "error": "err"}.get(level, "raw"))
@@ -1130,18 +1153,9 @@ def main():
         def _bloot_save(name, text):
             # permission "loot_write": write ONLY into loot/extras/<id>/ — a per-extra
             # namespace inside the loot tree, never a core loot file.
-            import re as _re
+            # symlink-safe, atomic and size-bounded (wdgo_extras.loot_save)
             try:
-                base = os.path.join(bk._app_dir, "loot", "extras", meta.id)
-                os.makedirs(base, exist_ok=True)
-                safe = _re.sub(r"[^A-Za-z0-9._ -]", "_", str(name)).strip(" ._") or "untitled"
-                safe = os.path.basename(safe)
-                if "." not in safe:
-                    safe += ".txt"
-                p = os.path.join(base, safe)
-                with open(p, "w", encoding="utf-8") as f:
-                    f.write(str(text))
-                return p
+                return wdgo_extras.loot_save(os.path.join(bk._app_dir, "loot"), meta.id, name, text)
             except Exception as _exc:
                 bk._term("[%s] loot save failed: %s" % (meta.id, _exc), "warn")
                 return None
@@ -1150,8 +1164,22 @@ def main():
         b.release_all = lambda: None
         return b
 
+    # a crash can leave sandboxed add-on processes behind: clean them up once
+    try:
+        import wdgo_extras_sandbox as _wxs
+        _wxs.reap_orphans()
+    except Exception:
+        pass
+
     while not window_should_close():
         t = get_time()
+        # a hub install/remove that finished after the hub screen closed -> rescan
+        if comp_screen != "extra":
+            try:
+                if wdgo_extras_hub.take_changes():
+                    dispatch(("r", "Rescan", "_extra_rescan", "_extra_rescan", None))
+            except Exception:
+                pass
         # menu-item dwell timer: reset while the menu is closed so the tooltip only
         # appears after the user actually settles on an item (TIP_DELAY seconds)
         if not menu_open:
@@ -1168,7 +1196,24 @@ def main():
             if _snd is not None:
                 try: play_sound(_snd)
                 except Exception: pass
-        if bk.consume_restart():          # OTA install finished -> relaunch to apply
+        # Collect a finished background ADS-B job (load or KML export). Assign the
+        # loaded tracks only if the player is still on the session they asked about.
+        if loot_adsb_busy and _adsb_job.get("done"):
+            loot_adsb_busy = False
+            _still = loot_detail is not None and loot_detail.get("name") == _adsb_job.get("name")
+            if _adsb_job.get("kind") == "load":
+                if _still and _adsb_job.get("data"):
+                    loot_adsb = _adsb_job["data"]; loot_adsb_sel, loot_adsb_msg = -1, ""
+                elif _still:
+                    loot_adsb_msg = "no ADS-B tracks in this session"
+            elif _adsb_job.get("kind") == "kml":
+                loot_adsb_msg = _adsb_job.get("msg", "")
+                if _still:
+                    loot_detail_files = bk.session_files(loot_detail["name"])
+            _adsb_job.clear()
+        if bk.consume_restart():          # OTA/restore finished -> relaunch to apply
+            pending_restart = True
+        if pending_restart and not bk.flash_busy():   # defer the relaunch until any flash is done
             bk.close(); close_window()
             os.execv(sys.executable, [sys.executable] + sys.argv)
         # a scan truly FINISHED (WiFi "Scan results printed" / BLE "Summary:") -> the
@@ -1177,18 +1222,32 @@ def main():
             if not bk.is_wardriving():        # continuous wardrive: keep sweeping, no modal
                 scanning = False
                 running_keys.discard("wifi_scan"); running_keys.discard("wardriving")
+                running_keys.discard("ble_scan")   # one-shot BLE scan finished: drop its key
                 if pending_scan:
                     scan_modal = pending_scan; scan_modal_scroll = 0
                     pending_scan = None; menu_open = False
         # safety net for a firmware that never signals completion: open late, only if
-        # results actually arrived (never an empty modal)
+        # results actually arrived (never an empty modal). Keep waiting past 14 s if
+        # nothing is in yet (a slow scan still pops its modal when done); give up only
+        # at a hard cap so a late completion isn't silently dropped.
         if pending_scan and t - pending_scan_t > 14.0:
             _have = bool(bk.networks()) if pending_scan == "wifi" else bool(bk.ble_devices or bk.airtags)
             if _have:
                 scan_modal = pending_scan; scan_modal_scroll = 0; menu_open = False
-            pending_scan = None
-        typing = bool(msg_screen or input_mode)   # suppress single-key shortcuts while typing
-        if not typing and not menu_open and not wl_screen and not flash_screen and not mc_region_screen and not comp_screen and not scan_modal and not confirm_quit:
+                pending_scan = None
+            elif t - pending_scan_t > 45.0:
+                bk.set_status("scan timed out - no results"); pending_scan = None
+        # suppress single-key shortcuts while typing text (chat, line input, or the
+        # Meshtastic owner-name field — else S/F/U etc. fire global actions mid-word)
+        typing = bool(msg_screen or input_mode or (mesh_screen and mesh_name_edit))
+        # A confirmation/dialog is on top: it must consume Y/N/Esc alone, and NOTHING
+        # beneath it (global map keys, loot/cluster nav, opening new screens) may act,
+        # so one keypress can't answer a hidden prompt or open a screen under it.
+        confirming = bool(confirm_quit or confirm_restore
+                          or confirm_del is not None or dep_prompt is not None)
+        if (not typing and not menu_open and not wl_screen and not flash_screen
+                and not mc_region_screen and not comp_screen and not scan_modal
+                and not confirming):
             if is_key_pressed(KEY_G): field = not field
             if is_key_pressed(KEY_F): toggle_borderless_windowed()   # manual (dev/non-labwc)
             if is_key_pressed(KEY_H) and bk.sdr_on() and \
@@ -1199,11 +1258,16 @@ def main():
                 if is_key_pressed(KEY_J): bk.keyhunt_reset_target()   # back to the car key
             # [C] cluster nav is handled in the map render block (needs cluster geometry)
             if is_key_pressed(KEY_S):          # S = definitive STOP (firmware + wardrive + attacks + cluster)
-                bk.stop_attacks(); bk.set_wardrive(None); bk.set_mode("idle")
-                bk.stop_cluster()              # tears down the ENOW bridge/brain too
+                bk.stop_attacks()              # unified: ESP + host Wi-Fi scanner + fleet
+                bk.set_wardrive(None); bk.set_mode("idle")
                 running_keys.clear(); scanning = False
+                pending_scan = None            # cancel any awaited scan dialog immediately
                 bk.set_status("STOP - all scanning/attacks/cluster halted")
-            if is_key_pressed(KEY_L) or is_key_pressed(KEY_GRAVE): loot_screen = not loot_screen
+            if is_key_pressed(KEY_L) or is_key_pressed(KEY_GRAVE):
+                loot_screen = not loot_screen
+                if not loot_screen:   # closing the whole DB: drop detail/preview/ADS-B
+                    loot_detail = None; loot_detail_files = []
+                    loot_preview = None; loot_adsb = None
             if is_key_pressed(KEY_P): data_screen = not data_screen
             if is_key_pressed(KEY_U):    # open the game-update (OTA) screen
                 comp_screen = "gameupd"; comp_sel = 0; comp_scroll = 0; bk.check_game_update()
@@ -1215,8 +1279,10 @@ def main():
             if is_key_pressed(KEY_ZERO) or is_key_pressed(KEY_KP_0):
                 zoom = 1.0; map_pan[0] = map_pan[1] = 0.0          # recenter on YOU + reset zoom
             # D-pad pans the map to explore away from your position (0 recenters).
-            # Only on the bare map — loot/cluster/data screens use the arrows themselves.
-            if not loot_screen and not cluster_screen and not data_screen and not prox_screen:
+            # Only on the bare map — loot/cluster/data screens use the arrows themselves,
+            # and while a map cluster is selected/drilled the arrows navigate clusters.
+            if (not loot_screen and not cluster_screen and not data_screen and not prox_screen
+                    and cluster_sel < 0 and not cluster_drill):
                 _ps = 12.0 / (9000.0 * max(0.0004, zoom))          # ~12 px/frame, in degrees (screen-constant)
                 if is_key_down(KEY_UP):    map_pan[0] += _ps
                 if is_key_down(KEY_DOWN):  map_pan[0] -= _ps
@@ -1225,35 +1291,64 @@ def main():
                 map_pan[0] = max(-85.0, min(85.0, map_pan[0]))
                 map_pan[1] = max(-180.0, min(180.0, map_pan[1]))
         if prox_screen and is_key_pressed(KEY_O): bk.prox_toggle()
-        if cluster_screen and not confirm_quit:    # cluster fleet screen
-            if is_key_pressed(KEY_X):               # stop the fleet core (and close)
-                bk.stop_cluster(); cluster_screen = False
-            if is_key_pressed(KEY_A):               # adopt the first pending joiner
-                _cj = bk.cluster_joins()
-                if _cj: bk.cluster_accept(_cj[0])
-            _fn = bk.cluster_nodes()                # select a node + pin its scan band
-            if _fn:
-                fleet_sel = max(0, min(fleet_sel, len(_fn) - 1))
-                if is_key_pressed(KEY_DOWN): fleet_sel = min(len(_fn) - 1, fleet_sel + 1)
-                if is_key_pressed(KEY_UP):   fleet_sel = max(0, fleet_sel - 1)
-                # LEFT/RIGHT cycle the selected node's manual channel band; AUTO hands
-                # it back to the brain's auto split.
-                if is_key_pressed(KEY_RIGHT): bk.cluster_cycle_band(_fn[fleet_sel].get("mac"), +1)
-                if is_key_pressed(KEY_LEFT):  bk.cluster_cycle_band(_fn[fleet_sel].get("mac"), -1)
-        if (loot_screen and is_key_pressed(KEY_D) and loot_detail is None
-                and loot_preview is None and confirm_del is None):
+        if cluster_screen and not confirming:      # cluster fleet screen
+            _fn = bk.cluster_nodes()
+            if cluster_overlay == "release":        # confirm: release node / whole fleet
+                if is_key_pressed(KEY_R):
+                    # Release ONLY the node whose MAC we captured when the prompt
+                    # opened. If it dropped off the fleet meanwhile, cancel instead of
+                    # releasing whatever row the index now points at.
+                    if cluster_release_mac and any(n.get("mac") == cluster_release_mac for n in _fn):
+                        bk.cluster_release(cluster_release_mac)
+                    else:
+                        bk.set_status("node gone - release cancelled")
+                    cluster_overlay = None
+                elif is_key_pressed(KEY_A):
+                    bk.cluster_release_all(); cluster_overlay = None
+            elif cluster_overlay == "export":       # QR of the fleet key — any of these closes it
+                if is_key_pressed(KEY_E):
+                    cluster_overlay = None
+            else:
+                if is_key_pressed(KEY_X):               # stop the fleet core (and close)
+                    bk.stop_cluster(); cluster_screen = False
+                elif is_key_pressed(KEY_A):             # adopt the first pending joiner
+                    _cj = bk.cluster_joins()
+                    if _cj: bk.cluster_accept(_cj[0])
+                elif is_key_pressed(KEY_E):             # export the fleet key (QR + line) for a phone
+                    cluster_overlay = "export"
+                elif is_key_pressed(KEY_R) and _fn:     # release a node from the fleet (asks first)
+                    cluster_release_mac = _fn[max(0, min(fleet_sel, len(_fn) - 1))].get("mac") or ""
+                    cluster_overlay = "release"
+                elif _fn:                               # select a node + pin its scan band
+                    fleet_sel = max(0, min(fleet_sel, len(_fn) - 1))
+                    if is_key_pressed(KEY_DOWN): fleet_sel = min(len(_fn) - 1, fleet_sel + 1)
+                    if is_key_pressed(KEY_UP):   fleet_sel = max(0, fleet_sel - 1)
+                    # LEFT/RIGHT cycle the selected node's manual channel band; AUTO hands
+                    # it back to the brain's auto split.
+                    if is_key_pressed(KEY_RIGHT): bk.cluster_cycle_band(_fn[fleet_sel].get("mac"), +1)
+                    if is_key_pressed(KEY_LEFT):  bk.cluster_cycle_band(_fn[fleet_sel].get("mac"), -1)
+        if (loot_screen and not data_screen and is_key_pressed(KEY_D) and loot_detail is None
+                and loot_preview is None and not confirming):
             data_screen = True   # password history
-        if loot_screen and not confirm_quit and confirm_del is None:  # loot nav (3 levels)
+        # Loot nav only runs when LOOT is the top view: Captured Data (data_screen)
+        # sits above it, so its keys must not drive the hidden session list.
+        if loot_screen and not data_screen and not confirming:  # loot nav (3 levels)
             if loot_adsb is not None:                                 # ADS-B tracks map
                 _ids = sorted(loot_adsb["tracks"], key=lambda k: -len(loot_adsb["tracks"][k]["pts"]))
                 if _ids:
                     if is_key_pressed(KEY_DOWN): loot_adsb_sel = min(len(_ids) - 1, loot_adsb_sel + 1)
                     if is_key_pressed(KEY_UP):   loot_adsb_sel = max(-1, loot_adsb_sel - 1)
                 if is_key_pressed(KEY_C): loot_adsb_cov = not loot_adsb_cov
-                if is_key_pressed(KEY_K) and loot_detail is not None:
-                    _kp = bk.adsb_export_kml(loot_detail["name"], loot_adsb)
-                    loot_adsb_msg = ("KML saved: " + _kp) if _kp else "KML export failed - see the terminal"
-                    loot_detail_files = bk.session_files(loot_detail["name"])
+                if is_key_pressed(KEY_K) and loot_detail is not None and not loot_adsb_busy:
+                    # KML export writes the whole track set — do it off the UI loop.
+                    loot_adsb_busy = True; loot_adsb_msg = "exporting KML..."
+                    _knm = loot_detail["name"]; _kdata = loot_adsb; _job = _adsb_job
+                    def _kml_worker(nm=_knm, data=_kdata, job=_job):
+                        kp = bk.adsb_export_kml(nm, data)
+                        job.update(kind="kml", name=nm,
+                                   msg=(("KML saved: " + kp) if kp else "KML export failed - see the terminal"),
+                                   done=True)
+                    threading.Thread(target=_kml_worker, daemon=True).start()
             elif loot_preview is not None:                            # L3: file preview
                 _plen = len(loot_preview.get("lines", []))
                 if is_key_pressed(KEY_DOWN): loot_preview_scroll += 1
@@ -1263,9 +1358,18 @@ def main():
             elif loot_detail is not None:                            # L2: session file list
                 if is_key_pressed(KEY_X):        # delete THIS session (asks first)
                     confirm_del = loot_detail["name"]
-                if is_key_pressed(KEY_A) and loot_detail["counts"].get("adsb"):
-                    loot_adsb = bk.adsb_tracks(loot_detail["name"])
-                    loot_adsb_sel, loot_adsb_msg = -1, ""
+                if is_key_pressed(KEY_A) and loot_detail["counts"].get("adsb") and not loot_adsb_busy:
+                    # The track reader can parse up to 200k points — load in the
+                    # background and show it only if we're still on this session.
+                    loot_adsb_busy = True; loot_adsb_msg = "loading tracks..."
+                    _anm = loot_detail["name"]; _job = _adsb_job
+                    def _adsb_worker(nm=_anm, job=_job):
+                        try:
+                            data = bk.adsb_tracks(nm)
+                        except Exception:
+                            data = None
+                        job.update(kind="load", name=nm, data=data, done=True)
+                    threading.Thread(target=_adsb_worker, daemon=True).start()
                 if loot_detail_files:
                     if is_key_pressed(KEY_DOWN): loot_detail_sel = min(len(loot_detail_files) - 1, loot_detail_sel + 1)
                     if is_key_pressed(KEY_UP):   loot_detail_sel = max(0, loot_detail_sel - 1)
@@ -1376,11 +1480,19 @@ def main():
                 if is_key_pressed(KEY_X): bk.subghz_cmd("stop")
             elif comp_screen == "mitm":
                 ifs = bk.mitm_ifaces()
+                sig = tuple(n for n, _ in ifs)
+                comp_sel = max(0, min(comp_sel, len(ifs) - 1)) if ifs else 0
                 if is_key_pressed(KEY_DOWN): comp_sel = min(max(0, len(ifs) - 1), comp_sel + 1)
                 if is_key_pressed(KEY_UP):   comp_sel = max(0, comp_sel - 1)
                 if is_key_pressed(KEY_S) and ifs and not bk.mitm_running():
-                    bk.mitm_start(ifs[comp_sel][0])
+                    # Interface vanished / list reshuffled -> never start on whatever row
+                    # the index now lands on; make the player re-confirm the visible pick.
+                    if sig != mitm_ifaces_sig:
+                        bk.set_status("interface list changed - check the selection, press S again")
+                    else:
+                        bk.mitm_start(ifs[comp_sel][0])
                 if is_key_pressed(KEY_X): bk.mitm_stop()
+                mitm_ifaces_sig = sig
             elif comp_screen == "watch":
                 if bk.watch_pin_requested():
                     c = get_char_pressed()
@@ -1417,7 +1529,11 @@ def main():
                 if is_key_pressed(KEY_UP):   flash_sel = max(0, flash_sel - 1)
                 if is_key_pressed(KEY_ENTER) and 0 <= flash_sel < len(fboards):
                     bk.flash_start(fboards[flash_sel][0])
-        if is_key_pressed(KEY_TAB) and not et_screen and not msg_screen and not data_screen: menu_open = not menu_open
+        # Tab toggles the menu, but NOT over a text field, the flash dialog, or a
+        # confirmation — opening the menu under the flash progress let B cut USB power.
+        if (is_key_pressed(KEY_TAB) and not et_screen and not msg_screen and not data_screen
+                and not flash_screen and not confirming):
+            menu_open = not menu_open
         if cluster_drill and not confirm_quit and not menu_open:
             _dp = clusters[cluster_sel]["points"] if 0 <= cluster_sel < len(clusters) else []
             if is_key_pressed(KEY_DOWN): cluster_scroll = min(max(0, len(_dp) - 1), cluster_scroll + 1)
@@ -1431,7 +1547,11 @@ def main():
             if is_key_pressed(KEY_DOWN): scan_modal_scroll += 1
             if is_key_pressed(KEY_UP):   scan_modal_scroll = max(0, scan_modal_scroll - 1)
         if is_key_pressed(KEY_ESCAPE):
-            if confirm_del is not None:       # cancel a pending session delete first
+            if dep_prompt is not None:        # cancel a module-enable prompt FIRST, don't quit
+                dep_prompt = None
+            elif cluster_overlay is not None:   # a fleet-screen modal (release/export) eats ESC first
+                cluster_overlay = None
+            elif confirm_del is not None:     # cancel a pending session delete first
                 confirm_del = None
             elif scan_modal:
                 if scan_modal == "airtag":   # fully end the continuous AirTag scan
@@ -1500,8 +1620,10 @@ def main():
                 confirm_quit = True
                 quit_modules = bk.active_modules()          # snapshot for the prompt
                 _qe = bk.entry_rails(); _qc = bk.rail_status()
-                quit_can_restore = bool(_qe and _qc and
-                    any(_qc.get(k) != _qe.get(k) for k in ("gps", "lora", "sdr")))
+                # only rails read as a real True/False on both sides count ("?" = unknown)
+                quit_can_restore = bool(_qe and _qc and any(
+                    isinstance(_qc.get(k), bool) and isinstance(_qe.get(k), bool)
+                    and _qc.get(k) != _qe.get(k) for k in ("gps", "lora", "sdr")))
         if confirm_quit:
             if bk.flash_busy():
                 if is_key_pressed(KEY_Y) or is_key_pressed(KEY_L) or is_key_pressed(KEY_R):
@@ -1605,6 +1727,28 @@ def main():
                     bk.run_evil_portal("FreeWiFi", phtml)
                     running_keys.add("portal")
                 et_screen = None; menu_open = False; scanning = True
+        elif input_mode == "fleetkey" and not confirm_quit:   # WDGFLEET1 line (type / paste / file)
+            ch = get_char_pressed()
+            while ch > 0:
+                if 32 <= ch < 127 and len(input_buf) < 96:
+                    input_buf += chr(ch)
+                ch = get_char_pressed()
+            if (is_key_down(KEY_LEFT_CONTROL) or is_key_down(KEY_RIGHT_CONTROL)) and is_key_pressed(KEY_V):
+                try:
+                    _clip = get_clipboard_text()
+                    _clip = _clip.decode() if isinstance(_clip, bytes) else (_clip or "")
+                    input_buf = (input_buf + _clip.strip())[:96]
+                except Exception:
+                    pass
+            if is_key_pressed(KEY_BACKSPACE): input_buf = input_buf[:-1]
+            if is_key_pressed(KEY_ESCAPE):
+                input_mode = None; input_item = None; input_buf = ""; fleet_import_msg = ("", True)
+            elif is_key_pressed(KEY_ENTER):
+                _ok, _msg = bk.fleet_key_import(input_buf)
+                fleet_import_msg = (_msg, _ok)
+                bk.set_status("Fleet key: " + _msg)
+                if _ok:
+                    input_buf = ""
         elif input_mode and not confirm_quit:      # capturing a target (bssid/ch or mac)
             ch = get_char_pressed()
             while ch > 0:
@@ -1715,6 +1859,12 @@ def main():
         def geo2scr(lat, lon):
             return (mcx + (lon - clon) * mscale * coslat, mcy - (lat - clat) * mscale)
 
+        def _ll_ok(lat, lon):
+            # Portal/game-state records can carry lat=null with a numeric lng; projecting
+            # those would raise TypeError and kill the whole map render. Skip them.
+            return (isinstance(lat, (int, float)) and isinstance(lon, (int, float))
+                    and math.isfinite(lat) and math.isfinite(lon))
+
         # rebuild clusters only when the view changes (zoom/center) or every 0.75s
         ckey = (round(zoom, 3), round(clat, 4), round(clon, 4), mapx0)
         if ckey != cl_cache_key or t - cl_cache_t > 0.75:
@@ -1748,6 +1898,7 @@ def main():
             clusters = _cls
             if cluster_sel >= len(clusters):
                 cluster_sel = -1
+                cluster_drill = False   # selected cluster vanished -> close its details too
 
         # ---- ctOS offline basemap (whole-world z0-6 raster tiles from MBTiles).
         #      Ground layer UNDER the grid/territory/markers. Each tile decodes to a
@@ -1835,6 +1986,8 @@ def main():
                 begin_scissor_mode(mapx0, by0, W - mapx0, by1 - by0)
                 for _dt in _tiles:
                     la = _dt.get("lat", 0.0); lo = _dt.get("lng", _dt.get("lon", 0.0))
+                    if not _ll_ok(la, lo):
+                        continue
                     ax, ay = geo2scr(la, lo)                      # SW corner
                     nx, ny = geo2scr(la + 0.01, lo + 0.01)        # NE corner
                     rx, ry = int(min(ax, nx)), int(min(ay, ny))
@@ -2036,6 +2189,8 @@ def main():
         # map. White = open, dim = already caught. Distance/compass are from OUR
         # GPS (backend recomputes them, not the server's area).
         for rb in bk.rabbits():
+            if not _ll_ok(rb.get("lat"), rb.get("lon")):
+                continue
             sx, sy = geo2scr(rb["lat"], rb["lon"])
             if not _onmap(sx, sy):
                 continue
@@ -2062,6 +2217,8 @@ def main():
         # zoom (>=1.65) so they don't pile up / overlap on the wider views.
         if zoom >= 1.65:
             for pp in bk.pwned_points():
+                if not _ll_ok(pp.get("lat"), pp.get("lon")):
+                    continue
                 sx, sy = geo2scr(pp["lat"], pp["lon"])
                 if not _onmap(sx, sy):
                     continue
@@ -2082,6 +2239,8 @@ def main():
         if not field:
             for rb in bk.rabbits():
                 if rb.get("state") not in (None, "open"):
+                    continue
+                if not _ll_ok(rb.get("lat"), rb.get("lon")):
                     continue
                 sx, sy = geo2scr(rb["lat"], rb["lon"])
                 if _onmap(sx, sy):
@@ -2118,7 +2277,10 @@ def main():
         # (decay_nearby) are drawn earlier as a map backdrop. Server uses 'lng'.
         if not field:
             for _ct in bk.gs_contracts():
-                sx, sy = geo2scr(_ct.get("lat", 0), _ct.get("lng", _ct.get("lon", 0)))
+                _cla = _ct.get("lat", 0); _clo = _ct.get("lng", _ct.get("lon", 0))
+                if not _ll_ok(_cla, _clo):
+                    continue
+                sx, sy = geo2scr(_cla, _clo)
                 if not _onmap(sx, sy):
                     continue
                 x, y = int(sx), int(sy)
@@ -2798,8 +2960,28 @@ def main():
                 if menu_open else "MAP  TAB=menu  C=cluster  ENTER=open  SPACE=hack  `=loot  P=creds  +/-=zoom  arrows=pan  0=home")
         text(mono, hint, 20, 44, 15, TXT)
 
+        # fleet-key import dialog (no camera on the uConsole: type / paste / file)
+        if input_mode == "fleetkey":
+            draw_rectangle(0, 0, W, H, C(3, 5, 9, 190))
+            bw, bhh = 900, 250; bx = (W - bw) // 2; byv = (H - bhh) // 2
+            cyber_panel(bx, byv, bw, bhh, TEAL)
+            gtext(dispB, "IMPORT FLEET KEY", bx + 28, byv + 20, 24, HI, 1)
+            text(mono, "WDGFLEET1:<32 hex>:<label>  from a Marauder / CardputerZero / phone QR.  Add ' force' to replace a different key.",
+                 bx + 28, byv + 54, 14, DIM)
+            draw_rectangle(bx + 28, byv + 80, bw - 56, 34, C(5, 8, 13, 255))
+            draw_rectangle_lines_ex(Rectangle(bx + 28, byv + 80, bw - 56, 34), 1, TEAL)
+            _shown = input_buf if len(input_buf) <= 78 else "..." + input_buf[-75:]
+            text(monoB, _shown + ("_" if int(t * 2) % 2 == 0 else " "), bx + 38, byv + 87, 17, HI)
+            _fm, _fok = fleet_import_msg
+            if _fm:
+                text(monoB, _fm[:96], bx + 28, byv + 126, 16, SUCCESS if _fok else WARN)
+            text(mono, "Empty + ENTER reads ~/.wdgo/fleet_import.txt.  Refused while the cluster runs (one core at a time).",
+                 bx + 28, byv + 160, 14, DIM)
+            text(mono, "SECRET: this key controls the whole node fleet.", bx + 28, byv + 182, 14, WARN)
+            text(mono, "[ENTER] import   [CTRL+V] paste   [ESC] close", bx + 28, byv + 214, 14, GHOST)
+
         # target-input dialog (Deauth/SAE bssid+ch, BT Tracker mac)
-        if input_mode:
+        if input_mode and input_mode != "fleetkey":
             draw_rectangle(0, 0, W, H, C(3, 5, 9, 170))
             bw, bhh = 540, 150; bx = (W - bw) // 2; byv = (H - bhh) // 2
             cyber_panel(bx, byv, bw, bhh, tcol)
@@ -3184,20 +3366,20 @@ def main():
                      "preset": "PRESET", "name": "NAME"}
             ry = py0 + 80
             for ri, rk in enumerate(_rows):
-                sel = (ri == mesh_sel)
-                if sel:
+                row_selected = (ri == mesh_sel)   # local only: never touch the menu's `sel`
+                if row_selected:
                     draw_rectangle(px0 + 20, ry - 4, pw - 40, 34, C(34, 211, 219, 30))
                     draw_rectangle(px0 + 20, ry - 4, 3, 34, TEAL)
                 if rk == "start":
                     gtext(dispB, "[ENTER]  START & CHAT", px0 + 36, ry,
-                          22, SUCCESS if sel else TEAL, 1)
+                          22, SUCCESS if row_selected else TEAL, 1)
                 else:
                     text(monoB, _rlab[rk], px0 + 36, ry, 16, TEAL)
                     if rk == "name":
                         _vt = _vals[rk]            # arrows don't apply; ENTER edits
                     else:
-                        _vt = ("< %s >" % _vals[rk]) if sel else _vals[rk]
-                    text(mono, str(_vt)[:40], px0 + 270, ry, 18, HI if sel else TXT)
+                        _vt = ("< %s >" % _vals[rk]) if row_selected else _vals[rk]
+                    text(mono, str(_vt)[:40], px0 + 270, ry, 18, HI if row_selected else TXT)
                 ry += 42
             _hint = ("[TYPE] name   [ENTER] save   [ESC] cancel" if mesh_name_edit
                      else "[UP/DOWN] row   [LEFT/RIGHT] change   [ENTER] edit/start   [ESC] back")
@@ -3616,8 +3798,10 @@ def main():
                 draw_line(24, 84, W - 24, 84, EDGE)
                 if not entries:
                     text(mono, "whitelist is empty - press [S] to scan & add", 24, 100, 18, WARN)
-                for i, (et, mac, nm) in enumerate(entries[:16]):
-                    ry = 94 + i * 28; on = i == wl_sel
+                _wfirst = min(max(0, wl_sel - 15), max(0, len(entries) - 16))   # window follows cursor
+                for vi, (et, mac, nm) in enumerate(entries[_wfirst:_wfirst + 16]):
+                    i = _wfirst + vi
+                    ry = 94 + vi * 28; on = i == wl_sel
                     if on:
                         draw_rectangle(24, ry - 3, W - 48, 24, C(255, 176, 32, 36)); draw_rectangle(24, ry - 3, 3, 24, WARN)
                     text(monoB, (et or "?").upper(), 24 + 8, ry, 17, TEAL if et == "wifi" else MAGENTA)
@@ -3631,8 +3815,10 @@ def main():
                 draw_line(24, 90, W - 24, 90, EDGE)
                 if not wln:
                     text(mono, "no networks - run a WiFi scan first (ESC back)", 24, 104, 18, WARN)
-                for i, n in enumerate(wln[:16]):
-                    ry = 100 + i * 28; on = i == wl_scan_sel
+                _sfirst = min(max(0, wl_scan_sel - 15), max(0, len(wln) - 16))   # window follows cursor
+                for vi, n in enumerate(wln[_sfirst:_sfirst + 16]):
+                    i = _sfirst + vi
+                    ry = 100 + vi * 28; on = i == wl_scan_sel
                     if on:
                         draw_rectangle(24, ry - 3, W - 48, 24, C(34, 211, 219, 40)); draw_rectangle(24, ry - 3, 3, 24, TEAL)
                     text(monoB, (n.ssid or "<hidden>")[:30], 32, ry, 17, HI if on else TXT)
@@ -3888,8 +4074,73 @@ def main():
                         if _gfix else
                         "GPS: no fix (indoors?) — fleet hits still logged, mapped once a fix lands"),
                  24, H - 52, 14, SUCCESS if _gfix else WARN)
-            text(mono, "[UP/DN] pick node   [L/R] task (AUTO/BLE/2.4G/5G)   [A] adopt   [X] stop core   [ESC] hide (keeps running)",
+            text(mono, "[UP/DN] node  [L/R] task  [A] adopt  [R] release  [E] export key  [X] stop  [ESC] hide",
                  24, H - 32, 15, TXT)
+
+            # ---------- fleet-screen modals: release confirm / fleet-key export ----------
+            if cluster_overlay == "release":
+                _ow, _oh = 760, 260
+                _ox, _oy = (W - _ow) // 2, (H - _oh) // 2
+                draw_rectangle(0, 0, W, H, C(2, 4, 8, 210))
+                cyber_panel(_ox, _oy, _ow, _oh, WARN)
+                gtext(dispB, "RELEASE NODE?", _ox + 30, _oy + 22, 26, WARN, 1)
+                _sel = _cn[fleet_sel] if 0 <= fleet_sel < len(_cn) else None
+                _mac = (_sel or {}).get("mac", "--")
+                text(mono, "Releasing tells the node to DROP the fleet key and re-join as new,", _ox + 30, _oy + 70, 16, TXT)
+                text(mono, "so another rig (e.g. a phone) can adopt it. Signed with the key.", _ox + 30, _oy + 94, 16, TXT)
+                text(monoB, "Selected node:  %s" % _mac, _ox + 30, _oy + 128, 18, ICE)
+                text(monoB, "[R] release THIS node", _ox + 30, _oy + 172, 18, SUCCESS)
+                text(monoB, "[A] release ALL nodes", _ox + 30, _oy + 200, 18, DANGER)
+                text(mono, "[ESC] cancel", _ox + _ow - 30 - tw(mono, "[ESC] cancel", 16), _oy + 200, 16, GHOST)
+            elif cluster_overlay == "export":
+                _line = bk.fleet_key_export()
+                _ow, _oh = 720, 560
+                _ox, _oy = (W - _ow) // 2, (H - _oh) // 2
+                draw_rectangle(0, 0, W, H, C(2, 4, 8, 220))
+                cyber_panel(_ox, _oy, _ow, _oh, TEAL)
+                gtext(dispB, "FLEET KEY  //  IMPORT ON PHONE", _ox + 30, _oy + 20, 22, HI, 1)
+                if not _line:
+                    text(monoB, "No fleet key on this rig (~/.wdgo/fleet.key).",
+                         _ox + 30, _oy + 90, 18, WARN)
+                    text(mono, "Adopt a node first, or copy the key here.", _ox + 30, _oy + 120, 16, DIM)
+                else:
+                    text(mono, "SECRET — show only to your own phone. Do NOT run the cluster",
+                         _ox + 30, _oy + 58, 14, WARN)
+                    text(mono, "on this rig AND the phone at the same time (they fight for nodes).",
+                         _ox + 30, _oy + 78, 14, WARN)
+                    try:
+                        import qr as _qrmod
+                        _m = _qrmod.matrix(_line)
+                    except Exception:
+                        _m = None
+                    if _m:
+                        _mods = len(_m)
+                        _scale = max(2, min(8, (_oh - 230) // _mods))
+                        _qpx = _mods * _scale
+                        _qx = _ox + (_ow - _qpx) // 2
+                        _qy = _oy + 104
+                        # white quiet-zone backing so a phone camera locks on
+                        draw_rectangle(_qx - _scale * 2, _qy - _scale * 2,
+                                       _qpx + _scale * 4, _qpx + _scale * 4, C(255, 255, 255, 255))
+                        for _ry, _row in enumerate(_m):
+                            for _rx, _dark in enumerate(_row):
+                                if _dark:
+                                    draw_rectangle(_qx + _rx * _scale, _qy + _ry * _scale,
+                                                   _scale, _scale, C(0, 0, 0, 255))
+                        _ly = _qy + _qpx + _scale * 2 + 14
+                    else:
+                        text(monoB, "(install 'segno' on this rig for a scannable QR)",
+                             _ox + 30, _oy + 110, 15, DIM)
+                        _ly = _oy + 150
+                    # the paste line, wrapped so the whole WDGFLEET1:... is readable
+                    text(mono, "or type / paste this line into the phone:", _ox + 30, _ly, 14, DIM)
+                    _ly += 22
+                    _chunk = 58
+                    for _i in range(0, len(_line), _chunk):
+                        text(monoB, _line[_i:_i + _chunk], _ox + 30, _ly, 15, SUCCESS)
+                        _ly += 20
+                text(mono, "[E] / [ESC] close", _ox + _ow - 30 - tw(mono, "[E] / [ESC] close", 14),
+                     _oy + _oh - 28, 14, GHOST)
 
         if prox_screen:
             PST = ("UNKNOWN", "WEAK", "NEAR", "CLOSE", "VERY CLOSE", "LOST")
@@ -3913,7 +4164,7 @@ def main():
                 for cxx, lab in cols:
                     text(mono, lab, cxx, hy, 15, DIM)
                 draw_line(24, hy + 22, W - 24, hy + 22, EDGE)
-                rows = bk.prox_rows()
+                rows = list(bk.prox_rows()) + [dict(r, _stranger=True) for r in bk.prox_strangers()]
                 if not rows:
                     text(monoB, "LISTENING", W // 2 - tw(monoB, "LISTENING", 22) / 2, 240, 22, TEAL)
                     text(mono, "no WDGWars nodes in range yet", W // 2 - tw(mono, "no WDGWars nodes in range yet", 18) / 2, 274, 18, DIM)
@@ -3926,8 +4177,11 @@ def main():
                         yy = hy + 40 + i * 40; i += 1
                         if i > 11: break
                         mut = r.get("mutual"); stt = r.get("state") or 0
-                        ncol = SUCCESS if mut else TEAL
+                        ncol = SUCCESS if mut else (TXT if r.get("_stranger") else TEAL)
                         text(monoB, lbl[:18], 24, yy, 18, ncol)
+                        _mdl = r.get("model") or ""
+                        if _mdl and not r.get("_stranger"):   # model; a stranger's label already has it
+                            text(mono, _mdl, 24, yy + 20, 13, DIM)
                         text(mono, PST[stt] if stt < len(PST) else "?", 260, yy, 18, HI)
                         text(mono, PTR.get(r.get("trend") or 0, ""), 440, yy, 18, ICE)
                         draw_rectangle_lines_ex(Rectangle(680, yy, 260, 16), 1, DIM)
@@ -3992,11 +4246,18 @@ def main():
             iby = H - 52
             draw_rectangle(0, iby, W, 52, C(7, 11, 17, 255)); draw_line(0, iby, W, iby, EDGE)
             prompt = "> "
-            cur = msg_buf + ("_" if int(t * 2) % 2 == 0 else " ")
-            text(monoB, prompt, 24, iby + 15, 20, tcolr)
-            text(mono, cur, 24 + tw(monoB, prompt, 20), iby + 15, 20, HI)
+            _ix = 24 + tw(monoB, prompt, 20)
             cc = "%d/120" % len(msg_buf)
-            text(mono, cc, W - 20 - tw(mono, cc, 14), iby + 6, 14, DIM)
+            _ccw = tw(mono, cc, 14)
+            cur = msg_buf + ("_" if int(t * 2) % 2 == 0 else " ")
+            # Scroll the visible text so the tail + cursor always stay on screen and
+            # never run under the char counter (the buffer can reach 120 chars).
+            _avail = (W - 20 - _ccw - 16) - _ix
+            while len(cur) > 1 and tw(mono, cur, 20) > _avail:
+                cur = cur[1:]
+            text(monoB, prompt, 24, iby + 15, 20, tcolr)
+            text(mono, cur, _ix, iby + 15, 20, HI)
+            text(mono, cc, W - 20 - _ccw, iby + 6, 14, DIM)
             if msg_screen == "mesh":
                 hint2 = "[TAB] nodes   [<>] band   [^T] stack   [ENTER] send   [ESC] close"
             elif msg_screen == "meshcore":
@@ -4092,7 +4353,7 @@ def main():
             _busy = bk.flash_busy()
             _mods = quit_modules if not _busy else []
             bw = 560          # wide enough for "loot stays on the SD card" either way
-            bhh = 158 + (58 if _mods else 0) + (26 if (_mods and quit_can_restore) else 0)
+            bhh = 158 + (58 if _mods else 0) + (34 if (quit_can_restore and not _busy) else 0)
             bx = (W - bw) // 2; byv = (H - bhh) // 2
             cyber_panel(bx, byv, bw, bhh, MAGENTA)
             gtext(dispB, "QUIT WatchDogsGo?", bx + 32, byv + 28, 30, HI, 1)
@@ -4100,12 +4361,20 @@ def main():
                 text(mono, "FLASH IN PROGRESS - cannot quit, wait for it to finish",
                      bx + 32, byv + 74, 16, DANGER)
                 gtext(dispB, "[N] NO", bx + bw - 150, byv + 106, 26, TEAL, 1)
-            elif _mods:
-                text(mono, "ACTIVE MODULES:  " + "   ".join(_mods), bx + 32, byv + 68, 17, WARN)
-                text(mono, "Power them down before leaving?", bx + 32, byv + 92, 15, DIM)
-                _ry = byv + 122
-                gtext(dispB, "[Y] OFF & QUIT", bx + 32, _ry, 22, MAGENTA, 1)
-                gtext(dispB, "[L] LEAVE ON", bx + 300, _ry, 22, TEAL, 1)
+            elif _mods or quit_can_restore:
+                # Show R whenever a pre-launch restore is possible, even with no active
+                # modules (the R key already works in that case — don't hide it).
+                if _mods:
+                    text(mono, "ACTIVE MODULES:  " + "   ".join(_mods), bx + 32, byv + 68, 17, WARN)
+                    text(mono, "Power them down before leaving?", bx + 32, byv + 92, 15, DIM)
+                    _ry = byv + 122
+                    gtext(dispB, "[Y] OFF & QUIT", bx + 32, _ry, 22, MAGENTA, 1)
+                    gtext(dispB, "[L] LEAVE ON", bx + 300, _ry, 22, TEAL, 1)
+                else:
+                    text(mono, "no active modules   ·   loot stays on the SD card",
+                         bx + 32, byv + 74, 16, DIM)
+                    _ry = byv + 106
+                    gtext(dispB, "[Y] QUIT", bx + 32, _ry, 22, MAGENTA, 1)
                 if quit_can_restore:
                     gtext(dispB, "[R] RESTORE PRE-LAUNCH", bx + 32, _ry + 34, 20, ICE, 1)
                 _fy = byv + bhh - 26
@@ -4134,7 +4403,10 @@ def main():
             cyber_panel(bx, byv, bw, bhh, DANGER)
             gtext(dispB, "DELETE SESSION?", bx + 32, byv + 24, 30, HI, 1)
             text(mono, confirm_del, bx + 32, byv + 66, 16, WARN)
-            _sz = bk.session_size(confirm_del)
+            if _del_size_name != confirm_del:     # measure the dir ONCE, not every frame
+                _del_size_name = confirm_del
+                _del_size_val = bk.session_size(confirm_del)
+            _sz = _del_size_val
             _szt = ("%.1f MB" % (_sz / 1048576.0)) if _sz >= 1048576 else ("%d KB" % (_sz // 1024))
             _cnt = ""
             for _s in (bk.sessions() or []):
@@ -4146,10 +4418,12 @@ def main():
                     break
             text(mono, "%s%s" % (_szt, _cnt), bx + 32, byv + 90, 14, DIM)
             if bk.session_uploaded(confirm_del):
-                text(mono, "uploaded to WDGWars - a copy is on the portal", bx + 32, byv + 116, 14, SUCCESS)
+                # The portal only receives wardrive/ADS-B/mesh ROWS. PCAPs and other
+                # local files are NOT uploaded, so don't claim a full copy exists.
+                text(mono, "synced rows are on WDGWars - PCAPs/local files are NOT", bx + 32, byv + 116, 14, WARN)
             else:
                 text(mono, "NOT uploaded - this is the only copy", bx + 32, byv + 116, 14, DANGER)
-            text(mono, "Permanent. Capture data cannot be recovered.", bx + 32, byv + 138, 15, WARN)
+            text(mono, "Permanent. Deletes ALL local files; cannot be recovered.", bx + 32, byv + 138, 15, WARN)
             gtext(dispB, "[Y] DELETE", bx + 32, byv + 166, 26, DANGER, 1)
             gtext(dispB, "[N] KEEP", bx + bw - 176, byv + 166, 26, TEAL, 1)
 
@@ -4197,7 +4471,8 @@ def main():
         if hunt_full and bk.sdr_on() and not field and not (
                 menu_open or loot_screen or data_screen or msg_screen or comp_screen
                 or flash_screen or wl_screen or cluster_screen or scan_modal
-                or prox_screen or mc_region_screen or mesh_screen or et_screen or confirm_quit):
+                or prox_screen or mc_region_screen or mesh_screen or et_screen
+                or confirming or pair_screen or radio_screen or cluster_drill):
             _hm = bk.sdr_mode().lower()
             if "keyhunt" in _hm:
                 _draw_hunt_panel(True)

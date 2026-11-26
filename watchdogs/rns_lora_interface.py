@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import math
 import threading
+import time
 
 log = logging.getLogger("rns_lora")
 
@@ -47,6 +48,10 @@ SINGLE_MTU = 255
 HEADER_L = 1
 FLAG_SPLIT = 0x01
 MAX_FRAME_PAYLOAD = SINGLE_MTU - HEADER_L  # 254 B per physical LoRa frame
+# The 2nd half of a split follows the 1st back-to-back (~0.75 s of airtime for a
+# full 255 B frame at SF8/BW125). A first half older than this is stale: its tail
+# was lost, and the same 4-bit seq may already belong to a different packet.
+SPLIT_TIMEOUT_S = 3.0
 
 
 def rnode_bitrate() -> float:
@@ -78,11 +83,20 @@ class SplitReassembler:
 
     Mirrors the firmware RX path: strip 1-byte header; non-split -> deliver as-is;
     split with a new seq -> buffer; split with the buffered seq -> concat+deliver.
+
+    Hardened against splicing two packets together after a lost fragment: a
+    first half must be a full MAX_FRAME_PAYLOAD frame and only waits
+    SPLIT_TIMEOUT_S (monotonic) for its tail. A seq collision inside that
+    window cannot be told apart without extra protocol information.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, clock=time.monotonic,
+                 timeout: float = SPLIT_TIMEOUT_S) -> None:
         self._buf: bytes | None = None
         self._seq: int | None = None
+        self._t0 = 0.0
+        self._clock = clock
+        self._timeout = timeout
 
     def reset(self) -> None:
         self._buf = None
@@ -99,13 +113,22 @@ class SplitReassembler:
         if not split:
             self.reset()
             return payload
-        if self._buf is not None and self._seq == seq:
+        now = self._clock()
+        if self._buf is not None and not (0 <= now - self._t0 <= self._timeout):
+            self.reset()                       # stale first half: its tail never came
+        if (self._buf is not None and self._seq == seq
+                and 0 < len(payload) <= MAX_FRAME_PAYLOAD):
             full = self._buf + payload
             self.reset()
             return full
-        # New split sequence — start buffering the first frame.
+        # New split sequence. Only a FULL frame can be a first half; anything
+        # shorter is an orphaned tail (its first half was lost) -> drop it.
+        if len(payload) != MAX_FRAME_PAYLOAD:
+            self.reset()
+            return None
         self._buf = payload
         self._seq = seq
+        self._t0 = now
         return None
 
 
@@ -153,6 +176,7 @@ class RNodeCompatInterface(_BaseInterface):
     # --- lifecycle ---
     def activate(self) -> None:
         """Mark online and register with RNS Transport."""
+        self._reasm.reset()                   # a new session never inherits a half packet
         self.online = True
         if _RNS_OK and self not in RNS.Transport.interfaces:
             RNS.Transport.interfaces.append(self)
@@ -160,6 +184,7 @@ class RNodeCompatInterface(_BaseInterface):
 
     def detach(self) -> None:
         self.online = False
+        self._reasm.reset()
         try:
             if _RNS_OK and self in RNS.Transport.interfaces:
                 RNS.Transport.interfaces.remove(self)

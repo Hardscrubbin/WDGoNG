@@ -16,7 +16,9 @@ TCPInterface. Without the rail the SX1262 init aborts (SIGABRT).
 from __future__ import annotations
 
 import logging
+import os
 import shutil
+import signal
 import socket
 import subprocess
 import threading
@@ -94,7 +96,8 @@ class MeshtasticManager:
         self.region = ""
         self.preset = ""
         self._iface = None
-        self._proc = None
+        self._proc = None               # the `sudo meshtasticd` WE launched (or None)
+        self._logf = None
         self._nodes: dict = {}          # node_id -> {id,name,lat,lon,snr,rssi,ts}
         self.messages: list = []        # [(sender, text, ts)]
         self._emitted_nodes: set = set()
@@ -138,6 +141,7 @@ class MeshtasticManager:
             self._emit("Meshtastic: meshtasticd or python lib missing", "error")
             return False
         if not self._launch_daemon():
+            self._stop_own_daemon()         # roll back a half-started launch
             return False
         if not self._connect():
             self._emit("Meshtastic: could not reach API on :%d" % MT_API_PORT, "error")
@@ -154,15 +158,13 @@ class MeshtasticManager:
         return True
 
     def _launch_daemon(self) -> bool:
+        if self._proc is not None and self._proc.poll() is not None:
+            self._stop_own_daemon()              # reap a daemon of ours that died
         if self._port_open():
             self._emit("Meshtastic: meshtasticd already running", "dim")
             return True
         try:
-            try:                                 # keep the daemon's own log for debugging
-                self._logf = open("/tmp/wdg_meshtasticd.log", "ab", buffering=0)
-                _out = self._logf
-            except Exception:
-                _out = subprocess.DEVNULL
+            _out = self._open_log()              # keep the daemon's own log for debugging
             _mtd = shutil.which("meshtasticd") or "/usr/bin/meshtasticd"
             self._proc = subprocess.Popen(
                 ["sudo", _mtd],                  # ABSOLUTE path: a relative argv[0]
@@ -184,6 +186,94 @@ class MeshtasticManager:
             time.sleep(0.5)
         self._emit("Meshtastic: meshtasticd did not open the API in time", "error")
         return False
+
+    def _open_log(self):
+        """Daemon log in /tmp, opened as root WITHOUT following a symlink."""
+        self._close_log()
+        try:
+            fd = os.open("/tmp/wdg_meshtasticd.log",
+                         os.O_WRONLY | os.O_CREAT | os.O_APPEND
+                         | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+                         0o600)
+            self._logf = os.fdopen(fd, "ab", buffering=0)
+            return self._logf
+        except Exception:
+            self._logf = None
+            return subprocess.DEVNULL
+
+    def _close_log(self) -> None:
+        f, self._logf = self._logf, None
+        if f is not None:
+            try:
+                f.close()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _descendants(pid: int) -> list:
+        """PIDs below `pid` in the process tree (from /proc), deepest last. Lets us
+        stop exactly the daemon WE started (sudo may run it under a pty monitor in
+        its own session, out of reach of a process-group signal)."""
+        children: dict = {}
+        try:
+            for d in os.listdir("/proc"):
+                if not d.isdigit():
+                    continue
+                try:
+                    with open("/proc/%s/stat" % d) as f:
+                        st = f.read()
+                    ppid = int(st.rsplit(")", 1)[1].split()[1])
+                except Exception:
+                    continue
+                children.setdefault(ppid, []).append(int(d))
+        except OSError:
+            return []
+        out, todo = [], [pid]
+        while todo:
+            for c in children.get(todo.pop(), []):
+                if c not in out:
+                    out.append(c)
+                    todo.append(c)
+        return out
+
+    def _stop_own_daemon(self, timeout: float = 8.0) -> None:
+        """Stop ONLY the meshtasticd this manager launched (a daemon that was
+        already running when we attached is left alone), reap it, close its log."""
+        p, self._proc = self._proc, None
+        if p is not None and p.poll() is None:
+            tree = self._descendants(p.pid)
+            try:
+                p.terminate()                # sudo relays SIGTERM to meshtasticd
+            except Exception:
+                pass
+            for pid in tree:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except OSError:
+                    pass
+            try:
+                p.wait(timeout=timeout)
+            except Exception:
+                for pid in [p.pid] + self._descendants(p.pid) + tree:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+                try:
+                    p.wait(timeout=3)
+                except Exception:
+                    pass
+            # wait for the tree we signalled to actually leave (frees the SX1262)
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline and any(
+                    os.path.exists("/proc/%d" % pid) for pid in tree):
+                time.sleep(0.1)
+        elif p is not None:
+            try:
+                p.wait(timeout=0.1)          # already exited: reap
+            except Exception:
+                pass
+        self._close_log()
 
     def _connect(self) -> bool:
         import meshtastic.tcp_interface
@@ -270,14 +360,10 @@ class MeshtasticManager:
         self.connected = False
         time.sleep(2)                            # let the node finish saving config
         if not self._port_open():                # daemon died on its failed reboot
-            try:
-                subprocess.run(["sudo", "pkill", "-f", "[m]eshtasticd"],
-                               timeout=10, check=False)
-            except Exception:
-                pass
+            self._stop_own_daemon()              # only ever our own process tree
             time.sleep(2)
-            self._proc = None
             if not self._launch_daemon():
+                self._stop_own_daemon()
                 self._emit("Meshtastic: daemon did not come back after config change",
                            "error")
                 return
@@ -412,6 +498,12 @@ class MeshtasticManager:
             return list(self._nodes.values())
 
     # ------------------------------------------------------------------
+    @property
+    def owns_daemon(self) -> bool:
+        """True when the meshtasticd in use was started by the game (and so may be
+        stopped by it); False for a daemon started outside the game."""
+        return self._proc is not None
+
     def stop(self) -> None:
         self._stop.set()
         self.running = False
@@ -422,11 +514,18 @@ class MeshtasticManager:
         except Exception:
             pass
         self._iface = None
-        # kill the daemon we started (free the SX1262 for MeshCore)
         try:
-            subprocess.run(["sudo", "pkill", "-f", "[m]eshtasticd"],
-                           timeout=10, check=False)
+            from pubsub import pub
+            pub.unsubscribe(self._on_receive, "meshtastic.receive.text")
         except Exception:
             pass
-        self._proc = None
-        self._emit("Meshtastic stopped (radio released)", "dim")
+        # stop the daemon WE started (frees the SX1262 for MeshCore); one that was
+        # already running before the game attached is not ours to kill
+        owned = self._proc is not None
+        self._stop_own_daemon()
+        t = self._poll_thread
+        if t is not None and t is not threading.current_thread():
+            t.join(timeout=6)
+        self._poll_thread = None
+        self._emit("Meshtastic stopped (radio released)" if owned else
+                   "Meshtastic disconnected (external meshtasticd left running)", "dim")

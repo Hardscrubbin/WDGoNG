@@ -520,7 +520,10 @@ class LoRaManager:
                         # Poll IRQ register directly — GPIO callback
                         # with bouncetime is unreliable, misses packets.
                         irq = lora.getIrqStatus()
-                        if irq & lora.IRQ_RX_DONE:
+                        rx_err = irq & (lora.IRQ_CRC_ERR | lora.IRQ_HEADER_ERR)
+                        # A packet flagged CRC/header error in the SAME IRQ read
+                        # as RX_DONE is corrupt: drop it, never decode it.
+                        if (irq & lora.IRQ_RX_DONE) and not rx_err:
                             lora.clearIrqStatus(0x03FF)
                             rxLen, rxIdx = lora.getRxBufferStatus()
                             lora._payloadTxRx = rxLen
@@ -534,7 +537,7 @@ class LoRaManager:
                                 self._do_tx(lora)
                             errors = 0
                             continue
-                        elif irq & (lora.IRQ_CRC_ERR | lora.IRQ_HEADER_ERR):
+                        elif rx_err:
                             lora.clearIrqStatus(0x03FF)
                             if self.mode == "rnode":
                                 self._rnode_crc_errs = getattr(
@@ -1066,22 +1069,29 @@ class LoRaManager:
 
         import struct
 
-        pubkey = payload[:32]
+        pubkey = bytes(payload[:32])
         timestamp = struct.unpack_from("<I", payload, 32)[0]
-        # signature at 36:100
-        flags_and_name = payload[100:]
+        signature = bytes(payload[36:100])
+        flags_and_name = bytes(payload[100:])
 
         node_id = pubkey[:4].hex()
         # Skip our own advert (echoed back by repeaters)
         _, our_pub = self._get_ed25519_keypair()
-        if bytes(pubkey) == our_pub:
+        if pubkey == our_pub:
             return
-        self._known_pubkeys[node_id] = bytes(pubkey)
-        self._emit(
-            f"  Node: {node_id}... ts:{timestamp}",
-            "attack_active",
-        )
 
+        # Ed25519 over pubkey + timestamp + appdata (the same bytes our own
+        # _build_mc_advert signs). Nothing from an advert that fails it may touch
+        # the contact list, the stored pubkeys or the map.
+        verified = self._verify_mc_advert(pubkey, payload[32:36], signature,
+                                          flags_and_name)
+        if verified is False:
+            self._emit(f"  Advert {node_id}: bad signature - dropped", "dim")
+            return
+
+        # Parse the appdata fully BEFORE changing any state: a frame whose flags
+        # announce more fields than it carries is rejected as a whole.
+        ntype, name, lat, lon, has_gps = "", "", 0.0, 0.0, False
         if len(flags_and_name) >= 2:
             flags = flags_and_name[0]
             # Node types: 0=none, 1=chat/client, 2=repeater, 3=room, 4=sensor
@@ -1091,16 +1101,19 @@ class LoRaManager:
 
             # Check for GPS (bit 4) and name (bit 7)
             off = 1
-            gps_str = ""
-            if flags & 0x10 and len(flags_and_name) >= off + 8:
-                lat_i = struct.unpack_from("<i", flags_and_name, off)[0]
-                lon_i = struct.unpack_from("<i", flags_and_name, off + 4)[0]
+            if flags & 0x10:
+                if len(flags_and_name) < off + 8:
+                    self._emit(f"  Advert {node_id}: truncated GPS field - dropped",
+                               "dim")
+                    return
+                lat_i, lon_i = struct.unpack_from("<ii", flags_and_name, off)
+                off += 8
                 lat = lat_i / 1_000_000
                 lon = lon_i / 1_000_000
-                gps_str = f" GPS:{lat:.5f},{lon:.5f}"
-                off += 8
+                has_gps = -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0
+                if not has_gps:
+                    lat = lon = 0.0
 
-            name = ""
             if off < len(flags_and_name):
                 name_bytes = flags_and_name[off:]
                 # Name is null-terminated; Repeater/Room nodes may
@@ -1111,21 +1124,58 @@ class LoRaManager:
                 decoded = raw.decode("utf-8", errors="ignore")
                 # Name = last run of normal text chars reaching end
                 m = re.search(r'[A-Za-z0-9][A-Za-z0-9 ._-]*$', decoded)
-                name = m.group().strip() if m else ""
+                name = m.group().strip()[:64] if m else ""
 
-            self._emit(
-                f"  [{ntype}] {name}{gps_str}",
-                "success",
+        if verified:
+            self._known_pubkeys[node_id] = pubkey
+        tag = "" if verified else " (unverified)"
+        self._emit(
+            f"  Node: {node_id}... ts:{timestamp}{tag}",
+            "attack_active",
+        )
+        if not ntype:
+            return
+        gps_str = f" GPS:{lat:.5f},{lon:.5f}" if has_gps else ""
+        self._emit(
+            f"  [{ntype}] {name}{gps_str}{tag}",
+            "success",
+        )
+        # Only a verified advert reaches the backend (contacts, loot, map).
+        if self._on_node and verified:
+            try:
+                self._on_node(node_id, ntype, name, lat, lon,
+                              lora_rssi, lora_snr, pubkey)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _verify_mc_advert(pubkey: bytes, ts_bytes, signature: bytes,
+                          appdata: bytes):
+        """True = valid signature, False = invalid, None = cannot check
+        (no Ed25519 implementation available)."""
+        try:
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+                Ed25519PublicKey,
             )
-
-            if self._on_node:
-                lat_val = lat if (flags & 0x10) else 0.0
-                lon_val = lon if (flags & 0x10) else 0.0
-                try:
-                    self._on_node(node_id, ntype, name, lat_val, lon_val,
-                                  lora_rssi, lora_snr, bytes(pubkey))
-                except Exception:
-                    pass
+            from cryptography.exceptions import InvalidSignature
+        except ImportError:
+            try:
+                import nacl.signing
+                import nacl.exceptions
+            except ImportError:
+                return None
+            try:
+                nacl.signing.VerifyKey(pubkey).verify(
+                    pubkey + bytes(ts_bytes) + appdata, signature)
+                return True
+            except (nacl.exceptions.BadSignatureError, ValueError, TypeError):
+                return False
+        try:
+            Ed25519PublicKey.from_public_bytes(pubkey).verify(
+                signature, pubkey + bytes(ts_bytes) + appdata)
+            return True
+        except (InvalidSignature, ValueError):
+            return False
 
     def _decode_mc_group_text(self, payload: bytearray, lora_rssi: float = 0, hops: int = 0) -> None:
         """Decode MeshCore Group Text (type 0x05) — try all configured channels."""
@@ -1590,6 +1640,8 @@ class LoRaManager:
         in LoRaRF that surgical fixes cannot fully restore.
         """
         while not self._tx_queue.empty():
+            if self._stop_event.is_set():
+                return                  # stopping: no new TX, cleanup sleeps the radio
             try:
                 packet = self._tx_queue.get_nowait()
             except Exception:
@@ -1600,9 +1652,11 @@ class LoRaManager:
                 lora.endPacket(5000)  # non-blocking! just initiates TX
 
                 # Wait for actual TX_DONE (endPacket returns immediately)
-                deadline = time.time() + 5.0
+                deadline = time.monotonic() + 5.0
                 tx_ok = False
-                while time.time() < deadline:
+                while time.monotonic() < deadline:
+                    if self._stop_event.is_set():
+                        return          # abandon the wait; _cleanup_radio sleeps the chip
                     irq = lora.getIrqStatus()
                     if irq & lora.IRQ_TX_DONE:
                         tx_ok = True
@@ -1693,9 +1747,19 @@ class LoRaManager:
     # Stop
     # ------------------------------------------------------------------
 
-    def stop(self) -> None:
-        """Signal the background thread to stop and wait for cleanup."""
+    def stop(self, timeout: float = 10.0) -> bool:
+        """Signal the background thread to stop and wait for its cleanup.
+
+        Returns True once the thread has really exited (SPI closed, radio asleep).
+        False means it is still running: the handle is KEPT (so a later stop()
+        can wait again and start_* stays blocked by `running`), and the caller
+        must not hand the SPI bus / GPIO to another stack yet."""
         self._stop_event.set()
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=5)
+        t = self._thread
+        if t is not None and t.is_alive():
+            t.join(timeout=timeout)
+            if t.is_alive():
+                log.warning("LoRa thread did not stop within %.1fs", timeout)
+                return False
         self._thread = None
+        return True

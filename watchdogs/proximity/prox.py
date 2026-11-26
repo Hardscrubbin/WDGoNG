@@ -173,10 +173,17 @@ class Directory:
     def resolve(self, ident, now_ms):
         if not ident:
             return None
+        slot = slot_of(now_ms)
         hit = self._cache.get(ident)
         if hit is not None:
-            return hit
-        slot = slot_of(now_ms)
+            label, matched = hit
+            # An ident is only that person while its slot is within the slack
+            # window; after that the same bytes are a replay (or a stale copy),
+            # so the cache must not keep resolving them.
+            if abs(slot - matched) <= SLOT_SLACK:
+                return label
+            del self._cache[ident]
+            return None
         # Neighbouring slots too. Two reasons, and both happen: a badge that
         # advertised just before the turn of the minute is still that person,
         # and two RTCs synced from NTP at different times will not agree to the
@@ -185,12 +192,16 @@ class Directory:
         for s in range(slot - SLOT_SLACK, slot + SLOT_SLACK + 1):
             for label, secret in self.keys.items():
                 if derive(secret, s) == ident:
-                    self._cache[ident] = label
+                    self._cache[ident] = (label, s)
                     return label
         return None
 
     def forget_stale(self, now_ms):
         """Drop cache entries for slots that can no longer be advertised."""
+        slot = slot_of(now_ms)
+        for ident in [i for i, (_l, s) in self._cache.items()
+                      if abs(slot - s) > SLOT_SLACK]:
+            del self._cache[ident]
         if len(self._cache) > 64:
             self._cache = {}
 
@@ -318,8 +329,9 @@ class Engine:
         if p is None:
             p = self.peers[ident] = Peer(ident, now_ms)
         p.observe(rssi, now_ms, saw_me=saw_me)
-        if p.label is None:
-            p.label = self.dir.resolve(ident, now_ms)
+        # Re-check on every sighting (cached, so cheap): a label is only valid
+        # while the ident's slot is, so an expired ident loses its name.
+        p.label = self.dir.resolve(ident, now_ms)
         self._contact(p, now_ms)
         return p
 

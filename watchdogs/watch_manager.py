@@ -24,6 +24,9 @@ NUS_TX_CHAR = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"  # watch → game (notify)
 
 SCAN_TIMEOUT = 10.0
 CONNECT_TIMEOUT = 15.0
+# Longest NUS JSON line we buffer (an NFC file dump is the biggest message).
+# A watch that keeps sending without a newline must not grow memory forever.
+NUS_MAX_LINE = 256 * 1024
 
 
 class WatchManager:
@@ -43,6 +46,7 @@ class WatchManager:
 
         # RX buffer for chunked NUS messages
         self._rx_buffer = ""
+        self._rx_discard = False   # dropping an over-long line up to its newline
 
         # State
         self._client = None
@@ -55,6 +59,11 @@ class WatchManager:
         self._pin_requested = False
         self._pin_value: Optional[int] = None
         self._pin_event = threading.Event()
+        # The BlueZ agent only answers for THIS device while a connect attempt
+        # is pairing; it is stopped (and unregistered) when that attempt ends.
+        self._agent_target: str = ""          # D-Bus object-path suffix dev_XX_..
+        self._agent_stop = threading.Event()
+        self._agent_stop.set()
 
         # Watch state cache
         self.battery: int = 0
@@ -161,6 +170,12 @@ class WatchManager:
 
     def provide_pin(self, pin: int) -> None:
         """Provide the 6-digit PIN shown on the watch."""
+        try:
+            pin = int(pin)
+        except (TypeError, ValueError):
+            return
+        if not 0 <= pin <= 999999:
+            return
         self._pin_value = pin
         self._pin_event.set()
 
@@ -275,11 +290,26 @@ class WatchManager:
         # returns Insufficient Authentication (0x05) which BlueZ resolves
         # by calling our agent's RequestPasskey. Agent needs to be up
         # before pairing is triggered.
+        self._agent_target = "dev_" + address.upper().replace(":", "_")
+        self._agent_stop.clear()
         agent_thread = threading.Thread(
             target=self._run_dbus_agent, daemon=True)
         agent_thread.start()
-        await asyncio.sleep(0.5)  # let agent register
+        try:
+            await asyncio.sleep(0.5)  # let agent register
+            await self._connect_session(address, BleakClient, BleakScanner)
+        finally:
+            # Every attempt ends the agent: found or not, paired or not.
+            self._end_agent()
+            await asyncio.to_thread(agent_thread.join, 3.0)
 
+    def _end_agent(self) -> None:
+        self._agent_stop.set()
+        self._agent_target = ""
+        self._pin_requested = False
+        self._pin_event.set()           # release a RequestPasskey still waiting
+
+    async def _connect_session(self, address, BleakClient, BleakScanner):
         # Discover device first (populates D-Bus cache)
         self._events.put(("status", f"Scanning for {address}..."))
         dev = await BleakScanner.find_device_by_address(address, timeout=10)
@@ -300,6 +330,8 @@ class WatchManager:
             self.connected = False
             self._events.put(("disconnected", address))
 
+        self._rx_buffer = ""
+        self._rx_discard = False
         async with BleakClient(
             dev,
             timeout=CONNECT_TIMEOUT,
@@ -328,6 +360,9 @@ class WatchManager:
             # Request initial status
             await self._nus_write(client, '{"cmd":"version"}\n')
             await self._nus_write(client, '{"cmd":"status"}\n')
+            # Subscribed + first writes went through = the link is authenticated;
+            # pairing is over, so stop answering agent requests.
+            self._end_agent()
 
             # Main loop: send queued commands, keepalive every 30s
             last_keepalive = time.time()
@@ -372,6 +407,11 @@ class WatchManager:
         self._rx_buffer += data.decode("utf-8", errors="replace")
         while "\n" in self._rx_buffer:
             line, self._rx_buffer = self._rx_buffer.split("\n", 1)
+            if self._rx_discard:              # tail of an over-long line
+                self._rx_discard = False
+                continue
+            if len(line) > NUS_MAX_LINE:
+                continue
             line = line.strip()
             if not line:
                 continue
@@ -379,7 +419,12 @@ class WatchManager:
                 msg = json.loads(line)
                 self._handle_message(msg)
             except json.JSONDecodeError:
-                self._events.put(("log", f"[Watch] {line}"))
+                self._events.put(("log", f"[Watch] {line[:200]}"))
+        if len(self._rx_buffer) > NUS_MAX_LINE:   # no newline in sight: drop it
+            self._rx_buffer = ""
+            if not self._rx_discard:
+                self._rx_discard = True
+                self._events.put(("log", "[Watch] over-long NUS message dropped"))
 
     def _handle_message(self, msg: dict):
         """Route parsed JSON message from watch."""
@@ -495,6 +540,33 @@ class WatchManager:
         bus = dbus.SystemBus()
         manager = self
 
+        class Rejected(dbus.DBusException):
+            _dbus_error_name = "org.bluez.Error.Rejected"
+
+        def _check(device):
+            """Only the watch we are connecting to, only while that attempt runs."""
+            target = manager._agent_target
+            if (manager._agent_stop.is_set() or not target
+                    or not str(device).endswith("/" + target)):
+                manager._events.put((
+                    "log", "[Watch] rejected pairing request from %s" % device))
+                raise Rejected("not the watch being paired")
+
+        def _wait_pin(device):
+            _check(device)
+            manager._pin_value = None
+            manager._pin_event.clear()
+            manager._pin_requested = True
+            manager._events.put(("pin_request", str(device)))
+            # Block until user provides PIN in game UI (or the attempt ends)
+            got = manager._pin_event.wait(timeout=60)
+            pin = manager._pin_value
+            manager._pin_requested = False
+            manager._pin_value = None
+            if not got or pin is None or manager._agent_stop.is_set():
+                raise Rejected("no PIN entered")
+            return pin
+
         class PipBoyAgent(dbus.service.Object):
             AGENT_PATH = "/watchdogs/pipboy_agent"
 
@@ -504,37 +576,37 @@ class WatchManager:
             @dbus.service.method("org.bluez.Agent1",
                                  in_signature="o", out_signature="u")
             def RequestPasskey(self, device):
-                manager._pin_requested = True
-                manager._pin_event.clear()
-                manager._events.put(("pin_request", str(device)))
-                # Block until user provides PIN in game UI
-                manager._pin_event.wait(timeout=60)
-                pin = manager._pin_value or 0
-                manager._pin_requested = False
-                return dbus.UInt32(pin)
+                return dbus.UInt32(_wait_pin(device))
 
             @dbus.service.method("org.bluez.Agent1",
                                  in_signature="ouq", out_signature="")
             def DisplayPasskey(self, device, passkey, entered):
+                _check(device)
                 manager._events.put((
                     "log", f"[Watch] Passkey: {passkey:06d}"))
 
             @dbus.service.method("org.bluez.Agent1",
                                  in_signature="ou", out_signature="")
             def RequestConfirmation(self, device, passkey):
-                # Auto-confirm
-                return
+                # Numeric comparison needs the user to compare two numbers; the
+                # game has no prompt for that, so never auto-confirm. The watch
+                # pairs by passkey entry (RequestPasskey) instead.
+                _check(device)
+                manager._events.put((
+                    "log", f"[Watch] numeric-comparison pairing ({passkey:06d}) "
+                           "rejected - use PIN entry"))
+                raise Rejected("confirmation not supported")
+
+            @dbus.service.method("org.bluez.Agent1",
+                                 in_signature="o", out_signature="")
+            def RequestAuthorization(self, device):
+                _check(device)
+                raise Rejected("just-works pairing not allowed")
 
             @dbus.service.method("org.bluez.Agent1",
                                  in_signature="o", out_signature="s")
             def RequestPinCode(self, device):
-                manager._pin_requested = True
-                manager._pin_event.clear()
-                manager._events.put(("pin_request", str(device)))
-                manager._pin_event.wait(timeout=60)
-                pin = str(manager._pin_value or 0).zfill(6)
-                manager._pin_requested = False
-                return pin
+                return str(_wait_pin(device)).zfill(6)
 
             @dbus.service.method("org.bluez.Agent1",
                                  in_signature="", out_signature="")
@@ -547,6 +619,7 @@ class WatchManager:
                 manager._pin_requested = False
                 manager._pin_event.set()
 
+        agent = None
         try:
             agent = PipBoyAgent()
             agent_mgr = dbus.Interface(
@@ -557,19 +630,24 @@ class WatchManager:
             self._events.put(("log", "[Watch] BLE agent registered"))
         except Exception as e:
             self._events.put(("log", f"[Watch] Agent error: {e}"))
+            try:
+                if agent is not None:
+                    agent.remove_from_connection()
+            except Exception:
+                pass
             return
 
         loop = GLib.MainLoop()
         self._glib_loop = loop
 
-        # Run until stop
+        # Run until this connect attempt ends (or the manager stops)
         def check_stop():
-            if self._stop_event.is_set():
+            if self._stop_event.is_set() or self._agent_stop.is_set():
                 loop.quit()
                 return False
             return True
 
-        GLib.timeout_add(1000, check_stop)
+        GLib.timeout_add(250, check_stop)
         try:
             loop.run()
         except Exception:
@@ -579,3 +657,8 @@ class WatchManager:
                 agent_mgr.UnregisterAgent(PipBoyAgent.AGENT_PATH)
             except Exception:
                 pass
+            try:                         # free the object path for the next attempt
+                agent.remove_from_connection()
+            except Exception:
+                pass
+            self._glib_loop = None

@@ -17,8 +17,10 @@ _MONITOR_USB_IDS = {
     "0bda:8812", "0bda:881a", "0bda:8813", "2357:0101", "2357:0103", "0e66:0023",  # RTL8812AU
     "0bda:a811", "0bda:0811", "0bda:8811",                                          # RTL8811AU
     "148f:5572", "0bda:8187", "148f:3070", "0cf3:9271",                             # older monitor cards
+    "0e8d:7961", "0846:9060",                                                       # MediaTek MT7921AU (AC1200/AX)
+    "0e8d:7612", "0846:9053", "0e8d:7610", "148f:7601",                             # MT7612U, MT7610U, MT7601U
 }
-_MONITOR_NAME_RE = re.compile(r"rtl88(12|11|14)|8812au|8811au|awus036ac", re.I)
+_MONITOR_NAME_RE = re.compile(r"rtl88(12|11|14)|8812au|8811au|awus036ac|mt79\d\d|mt76\d\d|mediatek", re.I)
 
 
 def _run(argv, timeout=4):
@@ -46,6 +48,15 @@ def _iface_driver(iface: str) -> str:
         return os.path.basename(os.path.realpath(link))
     except OSError:
         return ""
+
+
+def _iface_is_usb(iface: str) -> bool:
+    """True when the interface's device sits on a USB bus (any chipset): the sysfs
+    device path of a USB adapter runs through .../usbN/... ."""
+    try:
+        return "/usb" in os.path.realpath("/sys/class/net/%s/device" % iface)
+    except OSError:
+        return False
 
 
 def _iface_phy(iface: str) -> str:
@@ -95,7 +106,8 @@ def host_wifi_ifaces() -> list:
             uevent = open(os.path.join(path, "device", "uevent")).read().lower()
         except OSError:
             uevent = ""
-        is_usb = bool(usb) and any(u.replace(":", "/") in uevent or u in uevent for u in usb)
+        is_usb = _iface_is_usb(iface) or (
+            bool(usb) and any(u.replace(":", "/") in uevent or u in uevent for u in usb))
         monitor = _phy_monitor_capable(phy) if phy else False
         try:
             up = "up" in open(os.path.join(path, "operstate")).read()

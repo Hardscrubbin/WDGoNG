@@ -10,6 +10,7 @@ Uses ``pinctrl set/get`` directly for instant GPIO toggling.
 """
 
 import logging
+import re
 import shutil
 import subprocess
 import sys
@@ -29,6 +30,10 @@ GPIO_MAP = {
 }
 
 
+_LEVEL_RE = re.compile(r"\|\s*(hi|lo)\b")
+_LEVEL_FALLBACK_RE = re.compile(r"\b(hi|lo)\b")
+
+
 def _pinctrl_set(pin: int, high: bool) -> bool:
     """Set a GPIO pin via ``pinctrl set <pin> op dh|dl``."""
     state = "dh" if high else "dl"
@@ -46,10 +51,13 @@ def _pinctrl_set(pin: int, high: bool) -> bool:
         return False
 
 
-def _pinctrl_get(pin: int) -> bool:
+def _pinctrl_get(pin: int) -> Optional[bool]:
     """Read a GPIO pin state via ``pinctrl get <pin>``.
 
-    Returns True if pin is HIGH (``"hi"`` in output).
+    Returns True for HIGH, False for LOW and None when the level could NOT be
+    read (pinctrl failed, timed out or printed no level). Callers that restore
+    rails must treat None as "unknown" and leave that rail alone, never as LOW.
+    Output looks like ``27: op dh pd | hi // GPIO27 = output``.
     """
     try:
         result = subprocess.run(
@@ -60,9 +68,15 @@ def _pinctrl_get(pin: int) -> bool:
             text=True,
             timeout=3,
         )
-        return "hi" in (result.stdout or "")
     except Exception:
-        return False
+        return None
+    if result.returncode != 0:
+        return None
+    out = result.stdout or ""
+    m = _LEVEL_RE.search(out) or _LEVEL_FALLBACK_RE.search(out)
+    if not m:
+        return None
+    return m.group(1) == "hi"
 
 
 class AioManager:
@@ -77,8 +91,9 @@ class AioManager:
     def get_status() -> Optional[dict]:
         """Read all GPIO pin states directly.
 
-        Returns dict like ``{"gps": True, "lora": False, ...}``
-        or *None* if pinctrl is not available.
+        Returns dict like ``{"gps": True, "lora": False, "sdr": None, ...}``
+        (None = that pin could not be read, state unknown) or *None* if
+        pinctrl is not available.
         """
         if not shutil.which("pinctrl"):
             return None
