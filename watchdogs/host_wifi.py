@@ -163,7 +163,7 @@ class HostWifi:
     def _scan_loop(self):
         if self._current_type() == "monitor":
             self._set_mode("managed")                # scan needs managed mode
-        self._msg("[host-wifi] scanning on %s (%s)" % (self.iface, "AC1200"), "tx")
+        self._msg("[host-wifi] scanning on %s" % self.iface, "tx")
         while not self._stop.is_set():
             self._one_scan()
             self._stop.wait(4.0)                     # iw scan itself takes a few seconds
