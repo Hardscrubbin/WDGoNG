@@ -104,7 +104,7 @@ pentest and signals-intelligence rig that plays like a game:
 **One-liner** (uConsole / Raspberry Pi OS / Debian / Ubuntu):
 
 ```bash
-curl -sL https://locosp.github.io/WatchDogsGo/install-ng | sudo bash
+curl -sL https://locosp.github.io/WDGoNG/install | sudo bash
 ```
 
 **Or clone it yourself:**
