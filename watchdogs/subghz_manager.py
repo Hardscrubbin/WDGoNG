@@ -29,6 +29,12 @@ except Exception:  # pragma: no cover
     serial = None
 
 
+# Longest console line we buffer. JanOS RF lines are short (status, list rows,
+# RAW timing dumps a few KB); a device that keeps streaming without a newline
+# must not grow memory without bound.
+MAX_LINE_BYTES = 16 * 1024
+
+
 class SubGhzManager:
     def __init__(self):
         self.port: Optional[str] = None
@@ -125,11 +131,16 @@ class SubGhzManager:
                 s.rts = False
             except Exception:
                 pass
+            # A previous session's reader must be gone before a new one starts.
+            old = self._reader
+            if old is not None and old.is_alive():
+                old.join(timeout=2)
             self._ser = s
             self.port = port
             self.connected = True
-            self._stop.clear()
-            self._reader = threading.Thread(target=self._read_loop, daemon=True)
+            self._stop = threading.Event()        # per-session stop flag
+            self._reader = threading.Thread(target=self._read_loop,
+                                            args=(s, self._stop), daemon=True)
             self._reader.start()
             self._events.put(("log", f"[SUBGHZ] connected on {port}"))
             # Opening a CH340 port resets the ESP -> wait for JanOS RF to boot,
@@ -142,11 +153,34 @@ class SubGhzManager:
             return False
 
     # ---------------------------------------------------------------- reader
-    def _read_loop(self):
+    def _read_loop(self, ser=None, stop=None):
+        ser = ser if ser is not None else self._ser
+        stop = stop if stop is not None else self._stop
+        try:
+            self._read_session(ser, stop)
+        finally:
+            # This session's port is dead or stopped. Clear the manager state only
+            # if it still belongs to THIS session: a newer connect() must survive.
+            if self._ser is ser:
+                lost = not stop.is_set()
+                try:
+                    ser.close()
+                except Exception:
+                    pass
+                self._ser = None
+                self.connected = False
+                port, self.port = self.port, None
+                self.mode = "idle"
+                if lost:
+                    self._events.put(("error", f"Monster RF disconnected ({port})"))
+                    self._events.put(("disconnected", port))
+
+    def _read_session(self, ser, stop):
         buf = b""
-        while not self._stop.is_set() and self._ser is not None:
+        discarding = False                  # inside an over-long line: drop to next \n
+        while not stop.is_set() and ser is not None:
             try:
-                d = self._ser.read(4096)
+                d = ser.read(4096)
             except Exception:
                 break
             # END is often dropped on this console -> flush the list once the
@@ -160,10 +194,18 @@ class SubGhzManager:
             buf += d
             while b"\n" in buf:
                 line, buf = buf.split(b"\n", 1)
+                if discarding:
+                    discarding = False
+                    continue
+                if len(line) > MAX_LINE_BYTES:
+                    continue
                 text = line.decode(errors="replace").rstrip("\r")
                 if text.strip() in ("", ">"):
                     continue
                 self._handle_line(text)
+            if len(buf) > MAX_LINE_BYTES:   # no separator in sight: bound memory
+                buf = b""
+                discarding = True
 
     def _handle_line(self, text: str):
         t = text.strip()
@@ -396,11 +438,16 @@ class SubGhzManager:
 
     def stop(self):
         self._stop.set()
-        if self._ser is not None:
+        ser, self._ser = self._ser, None
+        if ser is not None:
             try:
-                self._ser.close()
+                ser.close()
             except Exception:
                 pass
-        self._ser = None
         self.connected = False
+        self.port = None
         self.mode = "idle"
+        t = self._reader
+        if t is not None and t is not threading.current_thread() and t.is_alive():
+            t.join(timeout=2)
+        self._reader = None

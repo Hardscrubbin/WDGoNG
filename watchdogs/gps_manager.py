@@ -3,6 +3,7 @@
 import glob
 import logging
 import os
+import time
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -57,6 +58,12 @@ class GpsManager:
         or os.environ.get("JANOS_GPS_DEVICE")
     )
 
+    # A fix older than this (no fresh valid sentence within the window) is treated
+    # as stale: the receiver went silent or lost lock, so the last known position
+    # must not keep geo-tagging new loot. GPS emits GGA/RMC at ~1 Hz, so this
+    # tolerates ~10 missed sentences before invalidating.
+    MAX_FIX_AGE = 10.0
+
     def __init__(self, device: str = GPS_DEVICE,
                  baud: int = GPS_BAUD_RATE) -> None:
         self.device = device
@@ -66,10 +73,59 @@ class GpsManager:
         self.fix = GpsFix()
         self._available = False
         self._gsv_visible: dict = {}  # constellation prefix → satellite count
+        # time.monotonic() of the last VALID fix; 0.0 = never had one. Monotonic
+        # so it is immune to NTP/system clock jumps.
+        self._fix_monotonic = 0.0
+        self._last_device: Optional[str] = None   # the port that opened last time
+
+    def reopen(self) -> bool:
+        """Reopen the port that worked last, after a read error closed it. Never
+        probes other ports, so it cannot poke an unrelated serial device (an
+        ESP32 can reset when its port is opened)."""
+        if self._available:
+            return True
+        if not self._last_device:
+            return False
+        return self._try_open(self._last_device)
 
     @property
     def available(self) -> bool:
         return self._available
+
+    def _mark_fix_time(self) -> None:
+        """Record that a valid fix was just parsed (for staleness ageing)."""
+        self._fix_monotonic = time.monotonic()
+
+    def fix_age(self) -> float:
+        """Seconds since the last valid fix (inf if there has never been one)."""
+        if self._fix_monotonic <= 0.0:
+            return float("inf")
+        return time.monotonic() - self._fix_monotonic
+
+    @property
+    def has_valid_fix(self) -> bool:
+        """True only when the port is open, the last fix was valid AND it is still
+        fresh. After GPS loss (silence or a read error) the frozen position goes
+        stale and this returns False — callers must gate geo-tagging on this, not
+        on ``available``/``fix.valid`` alone, or old loot gets the last position."""
+        return (self._available and self.fix.valid
+                and self.fix_age() <= self.MAX_FIX_AGE)
+
+    def _invalidate_fix(self, reason: str) -> None:
+        """Drop the current fix and close the port so it can be reopened. Called on
+        a read error (USB GPS unplugged / cable fault): the position is no longer
+        trustworthy and must not be reused for the rest of the drive."""
+        log.info("GPS invalidated (%s) — position dropped, port closed for reopen",
+                 reason)
+        self.fix.valid = False
+        self._fix_monotonic = 0.0
+        self._available = False
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
 
     # ------------------------------------------------------------------
     # Connection
@@ -130,6 +186,7 @@ class GpsManager:
             )
             self._conn.reset_input_buffer()
             self._available = True
+            self._last_device = device
             log.info("GPS opened: %s @ %d baud", device, self._baud)
             return True
         except Exception as exc:
@@ -198,7 +255,11 @@ class GpsManager:
             raw = self._conn.read(waiting)
             return self._buf.feed(raw)
         except Exception as exc:
+            # A read error means the port died (GPS unplugged / cable fault).
+            # Invalidate immediately so no further loot is tagged with a stale
+            # position, and close the port so a later setup() can reopen it.
             log.debug("GPS read error: %s", exc)
+            self._invalidate_fix("read error")
             return []
 
     def process_sentences(self, sentences: List[str]) -> None:
@@ -209,10 +270,31 @@ class GpsManager:
             except Exception as exc:
                 log.debug("GPS parse error: %s — %s", s.strip(), exc)
 
+    @staticmethod
+    def _checksum_ok(sentence: str) -> bool:
+        """Validate the NMEA ``*HH`` checksum (XOR of every char between $ and *).
+        A corrupted sentence (bit flips on a noisy UART) is rejected here so its
+        half-mangled fields never reach self.fix."""
+        if not sentence.startswith("$") or "*" not in sentence:
+            return False
+        body, _, cks = sentence[1:].partition("*")
+        cks = cks.strip()[:2]
+        if len(cks) != 2:
+            return False
+        try:
+            want = int(cks, 16)
+        except ValueError:
+            return False
+        got = 0
+        for ch in body:
+            got ^= ord(ch)
+        return got == want
+
     def _parse(self, sentence: str) -> None:
-        # Strip checksum
-        if "*" in sentence:
-            sentence = sentence.split("*")[0]
+        # Require and verify the NMEA checksum before trusting any field.
+        if not self._checksum_ok(sentence):
+            return
+        sentence = sentence.split("*")[0]
         parts = sentence.split(",")
         if len(parts) < 3:
             return
@@ -225,36 +307,85 @@ class GpsManager:
             self._parse_gsv(parts)
 
     def _parse_gga(self, p: List[str]) -> None:
-        """$GPGGA: time, lat, N/S, lon, E/W, quality, sats, hdop, alt, ..."""
+        """$GPGGA: time, lat, N/S, lon, E/W, quality, sats, hdop, alt, ...
+
+        Validate the whole fix (both coordinates present and in range) before
+        committing ANY of it, so a sentence with a good latitude but a truncated
+        longitude cannot leave self.fix holding a new lat beside a stale lon."""
         if len(p) < 10:
             return
-        self.fix.fix_quality = int(p[6]) if p[6] else 0
-        self.fix.valid = self.fix.fix_quality > 0
+        try:
+            quality = int(p[6]) if p[6] else 0
+        except ValueError:
+            return
+        valid = quality > 0
+        lat = lon = None
+        if valid:
+            if not (p[2] and p[3] and p[4] and p[5]):
+                return  # incomplete fix — do not publish a partial update
+            try:
+                lat = self._to_decimal(p[2], p[3])
+                lon = self._to_decimal(p[4], p[5])
+            except (ValueError, IndexError):
+                return
+            if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+                return
+        # Commit atomically now that the measurement validated.
+        self.fix.fix_quality = quality
+        self.fix.valid = valid
         if p[1]:
             self.fix.timestamp = p[1]
-        self.fix.satellites = int(p[7]) if p[7] else 0
-        self.fix.hdop = float(p[8]) if p[8] else 99.9
-        if p[2] and p[3]:
-            self.fix.latitude = self._to_decimal(p[2], p[3])
-        if p[4] and p[5]:
-            self.fix.longitude = self._to_decimal(p[4], p[5])
-        if p[9]:
-            self.fix.altitude = float(p[9])
+        try:
+            self.fix.satellites = int(p[7]) if p[7] else 0
+        except ValueError:
+            pass
+        try:
+            self.fix.hdop = float(p[8]) if p[8] else 99.9
+        except ValueError:
+            pass
+        if valid:
+            self.fix.latitude = lat
+            self.fix.longitude = lon
+            if p[9]:
+                try:
+                    self.fix.altitude = float(p[9])
+                except ValueError:
+                    pass
+            self._mark_fix_time()
 
     def _parse_rmc(self, p: List[str]) -> None:
-        """$GPRMC: time, status, lat, N/S, lon, E/W, speed, ..."""
+        """$GPRMC: time, status, lat, N/S, lon, E/W, speed, ...
+
+        Same all-or-nothing rule as GGA: only publish lat+lon together, and only
+        after both validate, so a bad field cannot mix two measurements."""
         if len(p) < 8:
             return
-        self.fix.valid = (p[2] == "A")
+        valid = (p[2] == "A")
+        lat = lon = speed = None
+        if valid:
+            if not (p[3] and p[4] and p[5] and p[6]):
+                return
+            try:
+                lat = self._to_decimal(p[3], p[4])
+                lon = self._to_decimal(p[5], p[6])
+            except (ValueError, IndexError):
+                return
+            if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+                return
+            if p[7]:
+                try:
+                    speed = float(p[7])
+                except ValueError:
+                    speed = None
+        self.fix.valid = valid
         if p[1]:
             self.fix.timestamp = p[1]
-        if p[2] == "A":
-            if p[3] and p[4]:
-                self.fix.latitude = self._to_decimal(p[3], p[4])
-            if p[5] and p[6]:
-                self.fix.longitude = self._to_decimal(p[5], p[6])
-            if p[7]:
-                self.fix.speed_knots = float(p[7])
+        if valid:
+            self.fix.latitude = lat
+            self.fix.longitude = lon
+            if speed is not None:
+                self.fix.speed_knots = speed
+            self._mark_fix_time()
 
     def _parse_gsv(self, p: List[str]) -> None:
         """$xxGSV: total_msgs, msg_num, sats_in_view, ..."""

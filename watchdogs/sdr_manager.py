@@ -4,6 +4,8 @@ Uses RTL-SDR (RTL2832U) on AIO v2 board via dump1090 and rtl_433.
 Subprocess + thread + queue pattern (same as serial_manager).
 """
 
+import csv
+import io
 import json
 import logging
 import os
@@ -400,14 +402,29 @@ class SDRManager:
         # test run under another account) would make rtl_power's write fail and
         # every band read back empty. PID-scoping avoids that collision entirely.
         tmp = f"/tmp/_wdg_emerg_{os.getpid()}.csv"
+        proc = None
         try:
-            self._emerg_proc = subprocess.Popen(
+            proc = subprocess.Popen(
                 ["rtl_power", "-f", f"{lo}:{hi}:{binw}", "-1",
                  "-i", EMERGENCY_INTEG, "-g", EMERGENCY_GAIN, tmp],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 preexec_fn=os.setsid)
-            self._emerg_proc.wait(timeout=8)
+            self._emerg_proc = proc
+            proc.wait(timeout=8)
         except Exception:
+            # Timeout (or spawn failure): the rtl_power child may still be holding
+            # the RTL-SDR. Kill its process group and REAP it before the next sweep
+            # opens another rtl_power on the same device, instead of just dropping
+            # the handle and leaving an orphan out of stop()'s reach (#16).
+            if proc is not None and proc.poll() is None:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=3)
+                except Exception:
+                    pass
             return None
         finally:
             self._emerg_proc = None
@@ -894,6 +911,18 @@ class SDRManager:
         self._emerg_proc = None
         self._grab_proc = None
 
+        # Wait for the reader threads to actually finish before returning, so a
+        # subsequent start_*() (which clears the shared stop event) can never leave
+        # a previous reader running against the new process (#17). Daemon threads,
+        # so a stuck one never blocks shutdown beyond the timeout.
+        threads, self._threads = self._threads, []
+        for t in threads:
+            if t is not threading.current_thread():
+                try:
+                    t.join(timeout=4)
+                except Exception:
+                    pass
+
         for f in (self._adsb_log, self._sensor_log, self._emerg_log,
                   self._scan_log, self._keyhunt_log):
             if f:
@@ -958,7 +987,12 @@ class SDRManager:
     def _sbs_reader(self):
         """Connect to dump1090 SBS output and parse aircraft data."""
         import socket
-        time.sleep(2)  # wait for dump1090 to start
+        # Interruptible wait: if stop() fires during this startup sleep the thread
+        # exits immediately, so stop()'s join returns before a restart clears the
+        # event — otherwise this old reader would wake to a fresh (unset) event and
+        # run alongside the new one (#17).
+        if self._stop_event.wait(2):  # wait for dump1090 to start
+            return
 
         while not self._stop_event.is_set():
             try:
@@ -982,9 +1016,8 @@ class SDRManager:
                         break
                 sock.close()
             except Exception:
-                if self._stop_event.is_set():
+                if self._stop_event.wait(3):  # retry connection (interruptible)
                     return
-                time.sleep(3)  # retry connection
 
     def _parse_sbs_line(self, line: str):
         """Parse SBS BaseStation format line.
@@ -1137,14 +1170,17 @@ class SDRManager:
             display_parts.append(f"RSSI:{rssi}")
         self._events.put(("log", " ".join(display_parts)))
 
-        # Log to CSV
+        # Log to CSV. Write the six fields through csv.writer so the JSON blob —
+        # which contains its own commas and double-quotes — is quoted/escaped
+        # correctly and stays in ONE column instead of spilling into extra ones (#23).
         if self._sensor_log:
             try:
                 safe_data = json.dumps(data, ensure_ascii=True)
-                self._sensor_log.write(
-                    f"{int(now)},{model},{sid_num},"
-                    f"\"{safe_data}\","
-                    f"{sensor.lat:.6f},{sensor.lon:.6f}\n")
+                buf = io.StringIO()
+                csv.writer(buf, lineterminator="\n").writerow(
+                    [int(now), model, sid_num, safe_data,
+                     f"{sensor.lat:.6f}", f"{sensor.lon:.6f}"])
+                self._sensor_log.write(buf.getvalue())
                 self._sensor_log.flush()
             except Exception:
                 pass

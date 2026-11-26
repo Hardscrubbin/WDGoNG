@@ -303,7 +303,7 @@ b3.set_node_channels(NODE2, (0, 13))        # pin NODE2 to the 2.4GHz indices
 out = b3.tick()
 fx = {mac: admin_fields(pay)[4:6] for mac, pay in out.tx}
 check(fx[NODE2] == (0, 13), "per-node pin: NODE2 scans its pinned window")
-check(fx[NODE1] == (0, 19) and fx[NODE3] == (20, 39), "per-node pin: other two auto-split the band")
+check(fx[NODE1] == (14, 26) and fx[NODE3] == (27, 39), "per-node pin: other two auto-split the channels the pin leaves free")
 check(b3.node_window(NODE2) == (0, 13), "node_window reports the pin")
 clk2["t"] += B.REAFFIRM_S + 1
 b3.set_node_channels(NODE2, None)           # clear -> back to the 3-way auto split

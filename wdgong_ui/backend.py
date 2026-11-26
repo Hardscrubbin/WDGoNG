@@ -21,6 +21,7 @@ import re
 import sys
 import threading
 import time
+from concurrent.futures import CancelledError
 from pathlib import Path
 from urllib.parse import parse_qs
 
@@ -110,6 +111,10 @@ def _snapshot(coll):
 class Backend:
     """Owns the shared AppState + managers and exposes simple data for the UI."""
 
+    # Makes the check-and-set of _mesh_switching atomic, so a stack switch and a
+    # region retune of the shared SX1262 can never run at the same time.
+    _MESH_GUARD = threading.Lock()
+
     def __init__(self) -> None:
         self.ok = HAVE_BACKEND
         self.app_dir = str(REPO) if REPO else os.getcwd()
@@ -127,6 +132,7 @@ class Backend:
         self._rabbits_seen = False       # printed the ranged one-time note yet
         self._rabbits_nofix_noted = False  # printed the "enable GPS" note yet
         self._pair_active = False        # device-pair flow running
+        self._pair_attempt = 0           # monotonic id: a worker only owns state while current
         self._pair_status = ""           # ""|requesting|waiting|done|expired|error
         self._pair_code = ""             # short code the player types on the portal
         self._pair_poll = ""             # poll secret
@@ -143,12 +149,14 @@ class Backend:
         self._db_xp = 0
         self._app_dir = self.app_dir
         self.captures: list[str] = []   # parsed Evil Twin / portal credentials
-        self._attack_busy = False       # a threaded attack sequence is running
+        self._attack_lock = threading.Lock()
+        self._attack_cancel = None      # each worker owns a distinct, one-use event
+        self._attack_worker = None
         self._mgrs: dict = {}           # lazily-built host-side managers
         self._scan_done_pulse = False   # one-shot WiFi-scan-finished flag for UI
         self._wardrive = None           # "scan_networks"/"scan_bt" => host-loop wardriving (legacy)
         self._wardrive_serial = None    # "wifi"/"bt"/"all" => firmware serial-wardrive streaming
-        self._wd_seen = set()           # MACs seen this serial-wardrive run (live new-detection)
+        self._wd_seen = set()           # MACs seen this loot session (live new-detection + XP gate)
         # radios: ESP32 (serial) and/or a host Wi-Fi card (AC1200). The matrix routes
         # each Wi-Fi function to a radio; with one radio present it all resolves to it.
         try:
@@ -165,6 +173,12 @@ class Backend:
         self._cluster_joins = []        # pending JOIN MACs awaiting operator ACCEPT
         self._cluster_recs = 0          # fleet records (CWD) ingested this run
         self._cluster_lock = threading.Lock()   # guards node dict mutate/prune vs render
+        self._loot_lock = threading.RLock()      # serialises session create + all loot-db saves
+        self._loot_frozen = False                # True while a restore replaces loot/ (no new session)
+        self._gps_starting = False               # guard: one background GPS bring-up at a time
+        self._wigle_lock = threading.Lock()      # one WiGLE upload at a time (manual + cluster auto)
+        self._gps_fix_mono = 0.0                 # monotonic time of last valid GPS fix (staleness)
+        self._GPS_STALE_SECS = 8.0               # invalidate a fix with no fresh NMEA for this long
         self._cluster_rec_marks = []    # (t, total) ring for fleet rec/min rate calc
         self._cluster_wifi_seen = set() # unique WiFi BSSIDs seen by the fleet this run
         self._cluster_ble_seen = set()  # unique BLE MACs seen by the fleet this run
@@ -226,6 +240,8 @@ class Backend:
         self.sniffer_aps: list = []
         self._loot_points_cache: list = []
         self._loot_points_ts = 0.0
+        self._loot_points_building = False    # background loot-points refresh in flight
+        self._watch_scan_busy = False         # one PipBoy BT scan at a time (runs off UI loop)
         self.battery_pct = -1
         self.batt_mv = 0                 # battery voltage (mV) - the honest low-batt signal
         self._batt_warned = False        # hysteresis latch for the low-voltage warning
@@ -236,6 +252,12 @@ class Backend:
         self._mc_nodes = {}             # node_id -> {lat,lon,name,type} for map icons
         self._mt_nodes = {}             # Meshtastic node_id -> {lat,lon,name,type}
         self._mesh_switching = False    # guard: one LoRa-stack switch at a time
+        # In-memory mesh defaults BEFORE the demo early-return below, so the LoRa
+        # Mesh screen (mesh_stack()/region/preset) works in demo mode too. The full
+        # backend path overlays persisted settings via _load_mesh_settings().
+        self._mesh = {"stack": "", "mc_region": "eu_uk_default",
+                      "mt_region": "EU_868", "mt_preset": "LONG_FAST", "mt_name": "",
+                      "last_stack": "", "cfg_mc": False, "cfg_mt": False}
         self.state = None
         self.serial = None
         self.gps = None
@@ -306,8 +328,10 @@ class Backend:
             aio = self._mgr("aio")
             if aio and aio.is_installed():
                 st = aio.get_status() or {}
-                self._entry_rails = {k: bool(st.get(k, False))
-                                     for k in ("gps", "lora", "sdr", "usb")}
+                # Only REAL readings: a pin pinctrl could not read (None) or did
+                # not report is left out, so 'restore' never drives it blindly.
+                self._entry_rails = {k: st[k] for k in ("gps", "lora", "sdr", "usb")
+                                     if isinstance(st.get(k), bool)}
                 self._sdr_rail = self._entry_rails.get("sdr", False)
         except Exception:
             pass
@@ -417,9 +441,14 @@ class Backend:
         self.set_status("BADGE: " + BADGE_HUD.get(badge, badge))
         if self.loot:
             try:
-                self.loot.save_badge(badge)
+                with self._loot_lock:            # serialise with other loot-db writers
+                    self.loot.save_badge(badge)
             except Exception:
                 pass
+        else:
+            # Earned before any write session exists: persist to the top-level
+            # loot db so the badge is not lost on quit.
+            self._persist_sessionless(badge=badge)
 
     # ------------------------------------------------------------------
     # WDGWars portal sync (community server) — NG's headless uploader
@@ -492,15 +521,25 @@ class Backend:
             self._term("WDGWars pairing unavailable", "warn")
             return
         self._pair_active = True
+        self._pair_attempt += 1          # per-attempt id: ignore results from old/cancelled runs
+        attempt = self._pair_attempt
         self._pair_status = "requesting"
         self._pair_code = ""
         self._pair_user = ""
         import threading as _th
-        _th.Thread(target=self._pair_worker, args=(p,), daemon=True).start()
+        _th.Thread(target=self._pair_worker, args=(p, attempt), daemon=True).start()
 
-    def _pair_worker(self, p) -> None:
+    def _pair_worker(self, p, attempt) -> None:
+        # This worker only owns the shared pairing state while it is the current
+        # attempt. A cancel (ESC) or a quick re-open bumps _pair_attempt, so a late
+        # network result from a stale run can neither adopt a key nor clobber the
+        # new attempt's fields.
+        def current() -> bool:
+            return self._pair_active and self._pair_attempt == attempt
         try:
             r = p.request_pair()
+            if not current():
+                return
             if not r or not r.get("code"):
                 self._pair_status = "error"
                 return
@@ -510,13 +549,29 @@ class Backend:
             self._pair_status = "waiting"
             self._term("[PAIR] code %s — enter it at wdgwars.pl/profile → API keys"
                        % self._pair_code, "tx")
-            while self._pair_active and time.time() < self._pair_expires:
+            while current() and time.time() < self._pair_expires:
                 time.sleep(3)
-                if not self._pair_active:
+                if not current():
                     return
                 res = p.poll_pair(self._pair_code, self._pair_poll)
+                if not current():        # cancelled/superseded during the network call
+                    return
                 if res.get("api_key"):
-                    p.adopt_api_key(res["api_key"])
+                    # Success only once the key is durably saved (adopt_api_key
+                    # returns True); never log the key or an error that may hold it.
+                    try:
+                        saved = p.adopt_api_key(res["api_key"]) is True
+                    except Exception as exc:
+                        saved = False
+                        self._term("[PAIR] key save raised %s" % type(exc).__name__, "warn")
+                    if not current():    # cancelled/superseded while saving
+                        return
+                    if not saved:
+                        self._pair_status = "error"
+                        self._term("[PAIR] could not save the key to secrets.conf - "
+                                   "pairing will not survive a restart", "err")
+                        self.set_status("WDGWars: could not save the key")
+                        return
                     self._pair_user = res.get("username", "")
                     self._pair_status = "done"
                     self._term("[PAIR] linked as %s" % (self._pair_user or "?"), "ok")
@@ -525,15 +580,18 @@ class Backend:
                 if res.get("error") == "bad_request":
                     self._pair_status = "expired"
                     return
-            if self._pair_status == "waiting":
+            if current() and self._pair_status == "waiting":
                 self._pair_status = "expired"
         except Exception:
-            self._pair_status = "error"
+            if current():
+                self._pair_status = "error"
         finally:
-            self._pair_active = False
+            if self._pair_attempt == attempt:
+                self._pair_active = False
 
     def pair_cancel(self) -> None:
         self._pair_active = False
+        self._pair_attempt += 1          # invalidate any in-flight pairing worker
 
     def pair_status(self) -> str:
         return self._pair_status
@@ -689,24 +747,95 @@ class Backend:
     def gs_decay(self) -> list:
         return self._gs_decay
 
+    def _persist_sessionless(self, xp=None, badge=None) -> None:
+        """Write xp/badges straight to loot/loot_db.json when there is no write
+        session yet, so progress earned before the first capture (e.g. 50 XP on the
+        historical-points map) survives a quit. A LootManager built later loads this
+        file in its constructor, so the state reconciles. Atomic (tmp + fsync + rename)."""
+        if not HAVE_BACKEND or getattr(self, "_loot_frozen", False):
+            return                               # a restore is replacing loot/ - don't write over it
+        p = Path(self._app_dir) / "loot" / "loot_db.json"
+        try:
+            with self._loot_lock:
+                try:
+                    with open(p, "r", encoding="utf-8") as fh:
+                        db = json.load(fh)
+                    if not isinstance(db, dict):
+                        db = {}
+                except Exception:
+                    db = {}
+                changed = False
+                if xp is not None and db.get("xp") != int(xp):
+                    db["xp"] = int(xp); changed = True
+                if badge is not None:
+                    badges = set(db.get("badges", []))
+                    if badge not in badges:
+                        badges.add(badge); db["badges"] = sorted(badges); changed = True
+                if not changed:
+                    return
+                p.parent.mkdir(parents=True, exist_ok=True)
+                tmp = p.with_suffix(".tmp")
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    json.dump(db, fh)
+                    fh.flush(); os.fsync(fh.fileno())
+                tmp.replace(p)
+        except Exception:
+            pass
+
     def _save_xp(self) -> None:
-        if self._xp_dirty and self.loot:
+        if not self._xp_dirty:
+            return
+        if self.loot:
             try:
-                self.loot.save_xp(self._xp)
+                with self._loot_lock:            # serialise with other loot-db writers
+                    self.loot.save_xp(self._xp)
                 self._xp_dirty = False
             except Exception:
                 pass
+        else:
+            # No write session yet: persist to the top-level loot db so a quit
+            # right after a map/XP gain does not lose it.
+            self._persist_sessionless(xp=self._xp)
+            self._xp_dirty = False
 
     def ensure_session(self) -> None:
-        """Lazily start a real loot write-session (first actual capture only)."""
+        """Lazily start a real loot write-session (first actual capture only).
+
+        The whole check-create-publish runs under one lock so two first events
+        (e.g. a MeshCore message and a UI scan start) can't each build a manager
+        for the same second-resolution directory and orphan one. A restore in
+        progress blocks session creation so the old manager can't write its db
+        over the just-restored data."""
         if self.loot is not None or not HAVE_BACKEND:
             return
-        try:
-            self.loot = LootManager(self._app_dir, self.gps)
-            self._term("loot capture session started", "ok")
-        except Exception as exc:
-            self.loot = None
-            self._term(f"loot session failed: {exc}", "warn")
+        if getattr(self, "_loot_frozen", False):
+            return                               # a restore/restart is replacing loot/
+        with self._loot_lock:
+            if self.loot is not None or getattr(self, "_loot_frozen", False):
+                return                           # lost the race / froze meanwhile
+            lm = None
+            try:
+                lm = LootManager(self._app_dir, self.gps)
+                if not getattr(lm, "active", True):
+                    # Out of space / unwritable: don't publish a dead manager (the
+                    # counters would keep ticking with nothing saved). Allow a retry.
+                    try:
+                        lm.close()
+                    except Exception:
+                        pass
+                    self._term("loot session inactive (disk full/unwritable?) - not recording", "warn")
+                    return
+                self._wd_seen = set()            # one "seen" set per loot session
+                self.loot = lm                   # publish only a live manager
+                self._term("loot capture session started", "ok")
+            except Exception as exc:
+                if lm is not None:
+                    try:
+                        lm.close()
+                    except Exception:
+                        pass
+                self.loot = None
+                self._term(f"loot session failed: {exc}", "warn")
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -729,7 +858,9 @@ class Backend:
             try:
                 aio = self._mgr("aio")
                 if aio and aio.is_installed():
-                    if not (aio.get_status() or {}).get("usb", False):
+                    # Ensure-ON target, not a toggle: an unknown reading (None) also
+                    # drives HIGH, which is a no-op when the rail is already up.
+                    if (aio.get_status() or {}).get("usb") is not True:
                         if aio.toggle("usb", True):
                             usb_just_on = True
                             self._term("[USB] AIO v2 rail ON - waiting for ESP32 boot...", "ok")
@@ -845,8 +976,28 @@ class Backend:
             except Exception:
                 pass
         if self.gps and self.gps_on:
+            if not self.gps.available and hasattr(self.gps, "reopen"):
+                # GpsManager closed the port after a read error (unplugged / cable
+                # fault): drop the position now and retry the same port every 5 s.
+                if self.state and self.state.gps_fix_valid:
+                    self.state.gps_fix_valid = False
+                    sdr = self._mgrs.get("sdr")
+                    if sdr is not None:
+                        try:
+                            sdr.update_gps(0.0, 0.0)
+                        except Exception:
+                            pass
+                now_r = time.monotonic()
+                if now_r - getattr(self, "_gps_reopen_t", 0.0) > 5.0:
+                    self._gps_reopen_t = now_r
+                    try:
+                        if self.gps.reopen():
+                            self._term("[GPS] reconnected", "ok")
+                    except Exception:
+                        pass
             try:
                 sents = self.gps.read_available()
+                now_m = time.monotonic()
                 if sents:
                     self.gps.process_sentences(sents)
                     f = self.gps.fix
@@ -860,10 +1011,30 @@ class Backend:
                     # and nothing refreshed it — so every emergency_rf.csv row was
                     # tagged 0,0 even after GPS locked. Push each new fix through.
                     if f.valid:
+                        self._gps_fix_mono = now_m    # last time we confirmed a position
                         sdr = self._mgrs.get("sdr")
                         if sdr is not None:
                             try:
                                 sdr.update_gps(f.latitude, f.longitude)
+                            except Exception:
+                                pass
+                else:
+                    # No fresh NMEA this frame. A live GPS emits ~1 Hz, so if the last
+                    # confirmed fix is older than the stale window the receiver is gone
+                    # or lost signal — but GpsManager still holds the old fix forever.
+                    # Age it ourselves so loot + SDR stop stamping new observations with
+                    # a position that is no longer true. (GpsManager exposes no fix age;
+                    # see the report for what it could add.)
+                    f = self.gps.fix
+                    if (f.valid and self._gps_fix_mono
+                            and now_m - self._gps_fix_mono > self._GPS_STALE_SECS):
+                        f.valid = False
+                        if self.state:
+                            self.state.gps_fix_valid = False
+                        sdr = self._mgrs.get("sdr")
+                        if sdr is not None:
+                            try:
+                                sdr.update_gps(0.0, 0.0)   # drop the stale position
                             except Exception:
                                 pass
             except Exception:
@@ -935,7 +1106,8 @@ class Backend:
         now = time.time()
         if self.loot and self.loot.active and now - self._last_recalc > 3.0:
             try:
-                self.loot.update_session_loot()
+                with self._loot_lock:            # serialise with mesh/radio-thread writers
+                    self.loot.update_session_loot()
             except Exception:
                 pass
             self._last_recalc = now
@@ -958,23 +1130,30 @@ class Backend:
             self._save_xp()
         except Exception:
             pass
-        # Never tear down under a running flash: the esptool child would be
-        # orphaned mid-write. Give it a bounded moment to finish on its own.
+        # Never tear down under a running flash: the esptool child would be orphaned
+        # mid-write. Wait for the flasher to actually finish — a single run can take
+        # FLASH_TOTAL_S, and there are up to two attempts plus boot/confirm, so a flat
+        # 60 s could quit mid-write. Cap at the flasher's own worst case so a wedged
+        # run can't block exit forever (the flasher enforces per-run timeouts).
         if getattr(self, "_flash_running", False):
             self._term("[SYS] waiting for the ESP32 flash to finish before exit...", "warn")
-            for _ in range(600):          # up to ~60s (the flasher has its own caps)
-                if not getattr(self, "_flash_running", False):
-                    break
+            cap = 2 * self.FLASH_TOTAL_S + 180.0      # both attempts + boot + confirm
+            end = time.time() + cap
+            while getattr(self, "_flash_running", False) and time.time() < end:
                 time.sleep(0.1)
+        # Proximity child procs (BLE scan + advertiser) are game-owned and must die
+        # on EVERY exit — even LEAVE ON, which only means "leave the module RAILS
+        # powered", not "orphan our processes". shutdown() keeps the on/off preference
+        # so a relaunch restarts proximity if it was enabled.
+        try:
+            _px = self._mgrs.get("prox")
+            if _px is not None:
+                _px.shutdown()
+        except Exception:
+            pass
         if modules in ("off", "restore"):
             try:
                 self.stop_attacks()       # halt host + ESP attacks/scans first
-            except Exception:
-                pass
-            try:
-                _px = self._mgrs.get("prox")   # kill the proximity BLE child procs, else they
-                if _px is not None:            # outlive the game, hold hci0 and keep scanning/advertising
-                    _px.shutdown()             # (kills scan+adv procs, keeps the on/off preference)
             except Exception:
                 pass
             try:
@@ -995,10 +1174,14 @@ class Backend:
         """Drive each AIO module to an on/off target. Turning a module OFF also
         stops its software; turning it ON only powers the rail (no stack is
         auto-started on the way out). USB is deliberately never touched — the
-        game must always keep the XIAO's USB rail powered."""
+        game must always keep the XIAO's USB rail powered. A missing key or a None
+        (rail state unknown at launch) is skipped, never treated as 'off'."""
         for feat in ("sdr", "gps", "lora"):
+            want = targets.get(feat)
+            if not isinstance(want, bool):
+                continue
             try:
-                self._apply_rail_target(feat, bool(targets.get(feat)))
+                self._apply_rail_target(feat, want)
             except Exception:
                 pass
 
@@ -1012,10 +1195,15 @@ class Backend:
                 try:
                     mt = self._mgrs.get("meshtastic")
                     if mt and getattr(mt, "running", False):
-                        mt.stop()
+                        mt.stop()                # stops OUR daemon only
                 except Exception:
                     pass
-                self._release_lora_spi()
+                holder = self._meshtasticd_holder()
+                if holder:                       # outside meshtasticd: keep its power
+                    self._report_radio_held(holder, "[LoRa]")
+                    return
+                if not self._release_lora_spi():  # MeshCore still running: keep the rail
+                    return
                 self._aio_lora(False)
         elif feat == "sdr":
             if on:
@@ -1040,12 +1228,16 @@ class Backend:
 
     # ---- live module state for the quit prompt ----
     def rail_status(self) -> dict:
-        """Current AIO rail state (gps/lora/sdr/usb booleans). One pinctrl read."""
+        """Current AIO rail state per gps/lora/sdr/usb: True/False, or "?" when the
+        pin could not be read. {} without AIO/pinctrl. One pinctrl read."""
         try:
             aio = self._mgr("aio")
             if aio and aio.is_installed():
-                st = aio.get_status() or {}
-                return {k: bool(st.get(k, False)) for k in ("gps", "lora", "sdr", "usb")}
+                st = aio.get_status()
+                if st is None:
+                    return {}
+                return {k: (st[k] if isinstance(st.get(k), bool) else "?")
+                        for k in ("gps", "lora", "sdr", "usb")}
         except Exception:
             pass
         return {}
@@ -1058,11 +1250,11 @@ class Backend:
         """Labels of modules currently powered/running, for the quit prompt."""
         st = self.rail_status()
         mods = []
-        if self.gps_on or st.get("gps"):
+        if self.gps_on or st.get("gps") is True:          # "?" (unknown) is not "on"
             mods.append("GPS")
-        if self.lora_on() or self.mt_running() or st.get("lora"):
+        if self.lora_on() or self.mt_running() or st.get("lora") is True:
             mods.append("LoRa")
-        if self.sdr_on() or self._sdr_rail or st.get("sdr"):
+        if self.sdr_on() or self._sdr_rail or st.get("sdr") is True:
             mods.append("SDR")
         return mods          # USB intentionally omitted — the XIAO rail stays on
 
@@ -1075,7 +1267,7 @@ class Backend:
         # raw serial log, exactly like the OG game.
         if self.loot:
             try:
-                self.loot.log_serial(line)
+                self.loot.log_serial(self._redact(line))
             except Exception:
                 pass
         # Firmware crash watch
@@ -1098,10 +1290,13 @@ class Backend:
         # telemetry + join events. CWD=record, CNODE=telemetry, CJOIN=pairing, CEVT=event.
         # Bridge mode: the ESP32 emits raw ENOW frames; the brain turns them into
         # CNODE/CWD/CJOIN (fed back through _ingest_cluster_line) and answers nodes.
-        if self._cluster_bridge and self._cluster_link is not None and line.startswith("ENOW,"):
+        if (self._cluster_bridge and self._cluster_link is not None
+                and line.lstrip("> ").startswith("ENOW,")):   # first frame can carry the '> ' prompt
             self._cluster_link.feed_line(line)
             return
         if self._cluster and line.startswith(("CWD,", "CNODE,", "CJOIN,", "CEVT,")):
+            if self._cluster_bridge and line.startswith("CJOIN,"):
+                return       # bridge mode: joins come only from the brain's validated pool
             self._ingest_cluster_line(line)
             return
         low = line.lower()
@@ -1115,10 +1310,11 @@ class Backend:
         if "post data" in low or "form submission" in low:
             if self.loot:
                 try:
-                    if self.state.evil_twin_running:
-                        self.loot.save_evil_twin_event(line)
-                    else:
-                        self.loot.save_portal_event(line)
+                    with self._loot_lock:
+                        if self.state.evil_twin_running:
+                            self.loot.save_evil_twin_event(line)
+                        else:
+                            self.loot.save_portal_event(line)
                 except Exception:
                     pass
             creds = self._parse_post_fields(line)
@@ -1129,9 +1325,9 @@ class Backend:
                 self._term("CAPTURED  " + creds, "ok")
                 self.set_status("captured: " + creds[:40])
             return
-        # handshake captured (loot.log_serial writes the pcap; reward here)
+        # Serial markers do not confirm a new, complete file. Award no handshake XP here.
         if "hccapx" in low or "handshake captured" in low or "eapol" in low and "saved" in low:
-            self.gain_xp(200); self.earn_badge("handshake_hunter")
+            self.earn_badge("handshake_hunter")
         # BLE scan results, firmware list format "N. MAC  RSSI: X dBm"
         bl = _BLE_LIST_RE.match(line)
         if bl:
@@ -1143,8 +1339,9 @@ class Backend:
                 self.gain_xp(1)
                 if self.loot:
                     try:
-                        self.loot.save_bt_device(mac, int(rssi), rest[:24], tag == "AirTag", tag == "SmartTag")
-                        self.loot.save_wardriving_bt(mac, int(rssi), rest[:24])
+                        with self._loot_lock:
+                            self.loot.save_bt_device(mac, int(rssi), rest[:24], tag == "AirTag", tag == "SmartTag")
+                            self.loot.save_wardriving_bt(mac, int(rssi), rest[:24])
                     except Exception: pass
                 if self._wardrive:   # continuous BT wardrive -> flowing log
                     self._term("[BLE] %-17s %sdBm %s" % (mac, rssi, (rest[:16] or tag)), "raw")
@@ -1173,8 +1370,9 @@ class Backend:
                 self.gain_xp(10)
                 if self.loot:
                     try:
-                        self.loot.save_bt_device(mac, int(rssi), name, tag == "AirTag", tag == "SmartTag")
-                        self.loot.save_wardriving_bt(mac, int(rssi), name)
+                        with self._loot_lock:
+                            self.loot.save_bt_device(mac, int(rssi), name, tag == "AirTag", tag == "SmartTag")
+                            self.loot.save_wardriving_bt(mac, int(rssi), name)
                     except Exception: pass
                 if self._wardrive:   # continuous BT wardrive -> flowing log
                     self._term("[BLE] %-17s %sdBm %s" % (mac, rssi, (name[:16] or tag)), "raw")
@@ -1184,7 +1382,9 @@ class Backend:
         if ma:
             self.airtags, self.smarttags = int(ma.group(1)), int(ma.group(2))
             if self.loot:
-                try: self.loot.save_bt_airtag_event(self.airtags, self.smarttags)
+                try:
+                    with self._loot_lock:
+                        self.loot.save_bt_airtag_event(self.airtags, self.smarttags)
                 except Exception: pass
             return
         # sniffer AP line "SSID, CHn: count"
@@ -1202,6 +1402,16 @@ class Backend:
                 if self.net.add_network(line):
                     net = self.state.networks[-1]
                     self.state.scan_done = True
+                    # Ignore-list: a whitelisted BSSID is never persisted or rewarded
+                    # on the wardrive sweep. Drop it from the live list too.
+                    if self._wardrive:
+                        try:
+                            wl = self._wl_mgr()
+                            if wl is not None and wl.is_blocked(getattr(net, "bssid", "")):
+                                del self.state.networks[-1]
+                                return
+                        except Exception:
+                            pass
                     self._check_pwned(net)   # cracked-password AP? notify + map mark
                     # Wardrive re-sweeps re-see the same APs: dedup the display list by
                     # BSSID (keep the latest sighting) so it GROWS on new finds, and only
@@ -1216,7 +1426,9 @@ class Backend:
                             self._term("[WiFi] %-20s ch%-3s %sdBm"
                                        % ((net.ssid or "<hidden>")[:20], net.channel, net.rssi), "raw")
                     if self.loot:
-                        try: self.loot.save_wardriving_network(net)
+                        try:
+                            with self._loot_lock:
+                                self.loot.save_wardriving_network(net)
                         except Exception: pass
                     return
             except Exception:
@@ -1246,8 +1458,21 @@ class Backend:
                                  "\u2026": "...", "\u201c": '"', "\u201d": '"', "\u201e": '"',
                                  "\u2018": "'", "\u2019": "'", "\u00b7": "-", "\u2022": "*"})
 
+    @staticmethod
+    def _redact(line: str) -> str:
+        """Mask fleet-bridge frame payloads (a JOIN_GRANT carries the raw fleet key)
+        before a line reaches the terminal or a log file."""
+        if not line or ("enow_tx" not in line and "ENOW," not in line):
+            return line
+        try:
+            from cluster_enow import redact_line
+        except Exception:                        # noqa: BLE001
+            import re as _re
+            return _re.sub(r"(enow_tx\s+\S+\s+)[0-9A-Fa-f]+", r"\1<redacted>", line)
+        return redact_line(line)
+
     def _term(self, msg: str, kind: str = "raw") -> None:
-        msg = str(msg).translate(self._TERM_ASCII)
+        msg = self._redact(str(msg)).translate(self._TERM_ASCII)
         self.term.append((time.strftime("%H:%M:%S"), msg, kind))
         if len(self.term) > 300:
             self.term = self.term[-300:]
@@ -1332,7 +1557,9 @@ class Backend:
                 self._wardrive_serial = kind
                 self.set_status("Wardrive %s - host card (%s)" % (kind, self._radio.host_iface()))
                 return
-        self._wd_seen = set()
+        # _wd_seen is NOT reset here: it lives as long as the loot session (reset in
+        # ensure_session), so restarting a wardrive or a parallel source (cluster,
+        # host card) does not re-award XP or re-count APs already seen this session.
         bands = {"wifi": "wifi24,wifi5", "bt": "ble",
                  "all": "wifi24,wifi5,ble"}.get(kind, "wifi24,wifi5,ble")
         self.send("set_wardrive_bands " + bands)
@@ -1347,7 +1574,6 @@ class Backend:
             iface = self._radio.host_iface()
             if not iface:
                 return False
-            self._wd_seen = set()
             self._host_wifi = HostWifi(
                 iface,
                 on_row=lambda row, bt: self._ingest_wardrive_row(row, bt),
@@ -1388,9 +1614,19 @@ class Backend:
         if len(parts) < 14:
             return
         mac, ssid, ch, rssi = parts[0].upper(), parts[1], parts[4], parts[6]
+        # Ignore-list: a whitelisted MAC must never be persisted or rewarded, on
+        # ANY wardrive path (node serial, host card, fleet). Drop it before disk/XP.
+        if persist:
+            try:
+                wl = self._wl_mgr()
+                if wl is not None and wl.is_blocked(mac):
+                    return
+            except Exception:
+                pass
         if persist and self.loot:
             try:
-                self.loot.append_wardrive_wigle(line)   # stamps host GPS + time, dedups
+                with self._loot_lock:
+                    self.loot.append_wardrive_wigle(line)   # stamps host GPS + time, dedups
             except Exception:
                 pass
         if mac in self._wd_seen:
@@ -1490,17 +1726,141 @@ class Backend:
                 self._cluster_sim_stop = None
             self._term("[CLUSTER] stopped", "warn")
             self.set_status("Cluster stopped")
+            if not getattr(self, "_cluster_demo", False):
+                self._cluster_auto_upload()
+
+    def _cluster_auto_upload(self) -> None:
+        """After the fleet stops, send what it collected without a trip to the menu:
+        WDGWars portal + WiGLE, each only if configured, in the background. Rows
+        without GPS are skipped by both uploads; the active session stays pending
+        so rows added later are offered again."""
+        try:
+            p = self._portal_sync()
+            if p is not None and p.configured:
+                self._term("[CLUSTER] auto-upload: WDGWars", "tx")
+                p.sync(all_sessions=True)
+        except Exception as exc:                     # noqa: BLE001
+            self._term("[CLUSTER] auto-upload WDGWars: %s" % exc, "warn")
+        self._act_wigle_up(quiet_unconfigured=True)
 
     def cluster_accept(self, mac: str) -> None:
         mac = (mac or "").strip()
         if not mac:
             return
-        if self._cluster_bridge and self._cluster_link is not None:
-            self._cluster_link.accept(mac)       # brain unicasts a signed JOIN_GRANT
-        else:
-            self.send("cluster_accept %s" % mac)
+        link = self._cluster_link
+        if self._cluster_bridge and link is not None:
+            # Bridge mode: the brain decides (fresh, source-checked JOIN_REQUEST,
+            # consumed once) and its pending list is the only source of truth.
+            mac = mac.lower()
+            self._cluster_joins = [m for m in self._cluster_joins if m != mac]
+            if not (self.serial and getattr(self.serial, "is_open", False)):
+                self._term("[CLUSTER] cannot accept %s: bridge serial not connected" % mac, "warn")
+                return
+            try:
+                granted = link.accept(mac)       # brain unicasts a signed JOIN_GRANT
+            except Exception as exc:             # noqa: BLE001
+                self._term("[CLUSTER] JOIN_GRANT for %s not sent: %s" % (mac, exc), "warn")
+                return
+            if granted:
+                self._term("[CLUSTER] accepting node %s" % mac, "ok")
+            else:
+                self._term("[CLUSTER] join request from %s expired / not found - "
+                           "wait for the node to ask again" % mac, "warn")
+            return
+        # Serial core / simulator: the core firmware does the final check; only
+        # forward a request this host still lists (a second [A] is a no-op).
+        if mac not in self._cluster_joins:
+            self._term("[CLUSTER] join request from %s expired / not found" % mac, "warn")
+            return
         self._cluster_joins = [m for m in self._cluster_joins if m != mac]
-        self._term("[CLUSTER] accepting node %s" % mac, "ok")
+        self.send("cluster_accept %s" % mac)
+        self._term("[CLUSTER] accepting node %s (sent to core)" % mac, "ok")
+
+    def cluster_release(self, mac: str) -> None:
+        """Release one node from the fleet: a signed RELEASE tells it to drop the
+        fleet key and fall back to JOIN_REQUEST, so another rig (e.g. a phone) can
+        adopt it. Only meaningful in bridge mode with a key present."""
+        mac = (mac or "").strip().lower()
+        if not mac:
+            return
+        if self._cluster_bridge and self._cluster_link is not None:
+            self._cluster_link.release(mac)
+        else:
+            self.send("cluster_release %s" % mac)
+        with self._cluster_lock:
+            self._cluster_nodes.pop(mac, None)
+        self._cluster_joins = [m for m in self._cluster_joins if m != mac]
+        self._term("[CLUSTER] releasing node %s" % mac, "warn")
+
+    def cluster_release_all(self) -> None:
+        """Release every node currently in the fleet."""
+        if self._cluster_bridge and self._cluster_link is not None:
+            self._cluster_link.release_all()
+        else:
+            self.send("cluster_release all")
+        with self._cluster_lock:
+            self._cluster_nodes = {}
+        self._cluster_joins = []
+        self._term("[CLUSTER] releasing ALL nodes", "warn")
+
+    def fleet_key_export(self) -> "Optional[str]":
+        """The fleet key as a QR/paste line 'WDGFLEET1:<32hex>:<label>' for a phone
+        to import, or None when no key is present. SECRET: only call this from an
+        explicit operator action (it reveals the raw key); never log the result."""
+        try:
+            import cluster_enow
+            key = cluster_enow.FleetKey.load()
+            raw = key.raw() if key.present else None
+        except Exception:                        # noqa: BLE001
+            raw = None
+        if not raw:
+            return None
+        import re
+        import socket
+        label = re.sub(r"[^A-Za-z0-9 _-]", "", socket.gethostname())[:24]
+        return "WDGFLEET1:%s:%s" % (raw.hex(), label)
+
+    FLEET_IMPORT_FILE = os.path.expanduser("~/.wdgo/fleet_import.txt")
+
+    def fleet_key_import(self, text: str) -> tuple:
+        """Install the fleet key from a WDGFLEET1:<32hex>:<label> line (typed, pasted,
+        or - when `text` is empty - read from ~/.wdgo/fleet_import.txt, also under
+        SUDO_USER's home). A trailing ' force' replaces a DIFFERENT existing key (the
+        old one is copied aside). Refused while the cluster runs: one fleet, many
+        cores, only ONE core active at a time. -> (ok, message). Never logs the key."""
+        if self._cluster:
+            return False, "stop the cluster first ([X] on the fleet screen)"
+        s = (text or "").strip()
+        force = False
+        if s.lower().endswith(" force"):
+            s, force = s[:-6].strip(), True
+        if not s:
+            paths = [self.FLEET_IMPORT_FILE]
+            su = os.environ.get("SUDO_USER")
+            if su:
+                try:
+                    import pwd
+                    paths.append(os.path.join(pwd.getpwnam(su).pw_dir, ".wdgo", "fleet_import.txt"))
+                except Exception:                # noqa: BLE001
+                    pass
+            for p in paths:
+                try:
+                    s = open(p).read().strip()
+                    if s:
+                        break
+                except OSError:
+                    continue
+            if not s:
+                return False, "nothing typed and no ~/.wdgo/fleet_import.txt"
+            if s.lower().endswith(" force"):
+                s, force = s[:-6].strip(), True
+        try:
+            import cluster_enow
+            ok, msg = cluster_enow.import_fleet_line(s, force=force)
+        except Exception as e:                   # noqa: BLE001
+            ok, msg = False, "import failed: %s" % e
+        self._term("[CLUSTER] fleet key import: %s" % msg, "ok" if ok else "warn")
+        return ok, msg
 
     def cluster_active(self) -> bool:
         return self._cluster
@@ -1567,6 +1927,12 @@ class Backend:
         self._term("[CLUSTER] node %s band -> %s" % (mac[-4:], label), "tx")
 
     def cluster_joins(self) -> list:
+        link = self._cluster_link
+        if self._cluster_bridge and link is not None:
+            try:
+                return link.pending_joins()      # the brain's live, unexpired requests
+            except Exception:                    # noqa: BLE001
+                return []
         return _snapshot(self._cluster_joins)
 
     def cluster_recs(self) -> int:
@@ -1611,7 +1977,7 @@ class Backend:
             "ble_devs": len(self._cluster_ble_seen),
             "ble_random": len(self._cluster_ble_random),
             "ble_public": len(self._cluster_ble_seen) - len(self._cluster_ble_random),
-            "joins": len(_snapshot(self._cluster_joins)),
+            "joins": len(self.cluster_joins()),
             "gps": bool(self.state and self.state.gps_fix_valid),
             "active": self._cluster,
         }
@@ -1812,7 +2178,12 @@ class Backend:
                     self._cluster_nodes[mac] = _nd
             elif kind == "CJOIN" and len(parts) >= 2:
                 mac = parts[1]
-                if mac and mac not in self._cluster_joins:
+                if self._cluster_bridge:
+                    # Bridge mode: only the brain emits CJOIN here and it keeps the
+                    # pending list itself (cluster_joins); just announce it.
+                    if mac:
+                        self._term("[CLUSTER] node %s wants to join — [A] to accept" % mac, "tx")
+                elif mac and mac not in self._cluster_joins:
                     self._cluster_joins.append(mac)
                     self._term("[CLUSTER] node %s wants to join — [A] to accept" % mac, "tx")
             elif kind == "CEVT" and len(parts) >= 2:
@@ -2041,70 +2412,110 @@ class Backend:
         except Exception:
             return [("Default (firmware)", None)]
 
+    def _start_attack_worker(self, name, sequence):
+        with self._attack_lock:
+            if self._attack_worker and self._attack_worker.is_alive():
+                return
+            self.ensure_session()
+            self.captures = []
+            cancelled = threading.Event()
+
+            def send(cmd):
+                # The HTML uploader also uses this callback for every chunk.
+                with self._attack_lock:
+                    if cancelled.is_set():
+                        raise CancelledError
+                    self.send(cmd)
+
+            def run():
+                try:
+                    sequence(cancelled, send)
+                except CancelledError:
+                    pass
+
+            self._attack_cancel = cancelled
+            self._attack_worker = threading.Thread(target=run, name=name, daemon=True)
+            self._attack_worker.start()
+
     def run_evil_twin(self, select_args: str, html, ssid: str) -> None:
         """Threaded: stop -> select_networks -> (upload html) -> start_evil_twin."""
-        if self._attack_busy:
-            return
-        self._attack_busy = True
-        self.ensure_session()
-        self.captures = []
-
-        def seq():
-            try:
-                if html is not None:
-                    self._term("[ET] uploading portal HTML...", "tx")
-                    upload_html_to_esp32(html, self.send)
-                    time.sleep(0.4)
-                self._term("[ET] stop (clean state)", "tx")
-                self.send("stop"); time.sleep(1.5)
+        def seq(cancelled, send):
+            if html is not None:
+                self._term("[ET] uploading portal HTML...", "tx")
+                upload_html_to_esp32(html, send)
+                if cancelled.wait(0.4):
+                    return
+            self._term("[ET] stop (clean state)", "tx")
+            send("stop")
+            if cancelled.wait(1.5):
+                return
+            with self._attack_lock:
+                if cancelled.is_set():
+                    return
                 if self.serial and self.serial.is_open:
                     try:
                         self.serial.read_available()  # drain stale
                     except Exception:
                         pass
-                self.send("select_networks " + select_args); time.sleep(0.5)
+                self.send("select_networks " + select_args)
+            if cancelled.wait(0.5):
+                return
+            with self._attack_lock:
+                if cancelled.is_set():
+                    return
                 self.send("start_evil_twin")
                 if self.state:
                     self.state.evil_twin_running = True
                     self.state.evil_twin_ssid = ssid
                 self.set_status("Evil Twin live - SSID " + ssid)
                 self._term("[ET] running - SSID " + ssid, "warn")
-            finally:
-                self._attack_busy = False
 
-        threading.Thread(target=seq, name="evil-twin", daemon=True).start()
+        self._start_attack_worker("evil-twin", seq)
 
     def run_evil_portal(self, ssid: str, html) -> None:
         """Threaded: (upload html) -> start_portal <ssid>."""
-        if self._attack_busy:
-            return
-        self._attack_busy = True
-        self.ensure_session()
-        self.captures = []
-
-        def seq():
-            try:
-                if html is not None:
-                    self._term("[EP] uploading portal HTML...", "tx")
-                    upload_html_to_esp32(html, self.send)
-                    time.sleep(0.4)
+        def seq(cancelled, send):
+            if html is not None:
+                self._term("[EP] uploading portal HTML...", "tx")
+                upload_html_to_esp32(html, send)
+                if cancelled.wait(0.4):
+                    return
+            with self._attack_lock:
+                if cancelled.is_set():
+                    return
                 self.send("start_portal " + ssid)
                 if self.state:
                     self.state.portal_running = True
                     self.state.portal_ssid = ssid
                 self.set_status("Evil Portal live - SSID " + ssid)
                 self._term("[EP] running - SSID " + ssid, "warn")
-            finally:
-                self._attack_busy = False
 
-        threading.Thread(target=seq, name="evil-portal", daemon=True).start()
+        self._start_attack_worker("evil-portal", seq)
 
     def stop_attacks(self) -> None:
-        self.send("stop")
-        self._wardrive_serial = None
-        if self.state:
-            self.state.evil_twin_running = False
-            self.state.portal_running = False
+        """Unified hard STOP: ESP32 + host-side data sources + fleet. Safe to call
+        repeatedly (map 'S', menu STOP ALL, exit all route here)."""
+        with self._attack_lock:
+            worker = self._attack_worker
+            if self._attack_cancel is not None:
+                self._attack_cancel.set()
+            self.send("stop")
+            # Stop the host data producers FIRST so a late scan/fleet callback can't
+            # re-populate state right after we clear it. Both are idempotent.
+            try:
+                self.stop_wardrive_serial()     # host Wi-Fi scanner thread
+            except Exception:
+                pass
+            try:
+                self.stop_cluster()             # node fleet controller
+            except Exception:
+                pass
+            self._wardrive_serial = None
+            if self.state:
+                self.state.evil_twin_running = False
+                self.state.portal_running = False
+        if worker and worker is not threading.current_thread():
+            worker.join(timeout=1.0)
         # stop any host-side subsystems we started
         for name in ("sdr", "lora", "dragon", "mitm", "subghz"):
             m = self._mgrs.get(name)
@@ -2282,12 +2693,24 @@ class Backend:
         yet. Returns True if GPS is on (a fix may still be pending - wardriving records
         either way and geotags rows once the fix arrives)."""
         if not self.gps_on:
-            self._term("[%s] needs GPS - enabling it..." % reason, "warn")
-            if not self._gps_bring_up():
-                self._term("[%s] GPS could not start - rows will have no position "
-                           "until GPS works" % reason, "warn")
-                return False
-            self._term("[SYS] GPS enabled %s" % (self.gps.device or ""), "ok")
+            # Bring GPS up in the BACKGROUND: _gps_bring_up() can block for several
+            # seconds (cold rail + per-port setup waits), which would freeze the UI
+            # loop (no frames, no STOP, no serial drain). Data collection starts now;
+            # rows geotag once the fix arrives. One attempt at a time.
+            if not getattr(self, "_gps_starting", False):
+                self._gps_starting = True
+                self._term("[%s] needs GPS - enabling it in the background..." % reason, "warn")
+                def _bring():
+                    try:
+                        if self._gps_bring_up():
+                            self._term("[SYS] GPS enabled %s" % (self.gps.device or ""), "ok")
+                        else:
+                            self._term("[%s] GPS could not start - rows will have no "
+                                       "position until GPS works" % reason, "warn")
+                    finally:
+                        self._gps_starting = False
+                self._thread(_bring, "gps-start")
+            return False
         if not (self.state and getattr(self.state, "gps_fix_valid", False)):
             self._term("[%s] GPS searching for a fix - rows geotag once it locks" % reason, "raw")
         return True
@@ -2310,22 +2733,42 @@ class Backend:
         lora = self._mgr("lora")
         if lora is None:
             self._term("[LoRa] manager unavailable", "warn"); return
+        if not self._claim_mesh_op():               # serialized with stack switches
+            self._term("[LoRa] radio switch already in progress...", "warn"); return
         def run():
             try:
                 if getattr(lora, "running", False):
-                    lora.stop(); self._aio_lora(False); self._term("[LoRa] stopped", "warn")
+                    try:
+                        stopped = lora.stop()
+                    except Exception as exc:
+                        self._term(f"[LoRa] stop failed: {exc}", "warn")
+                        stopped = False
+                    if stopped is False:            # thread still up: rail stays on
+                        self._report_radio_busy()
+                        return
+                    self._cut_lora_rail(); self._term("[LoRa] stopped", "warn")
                 else:
+                    holder = self._meshtasticd_holder()
+                    if holder:                      # meshtasticd owns the SX1262
+                        self._report_radio_held(holder, "[LoRa]")
+                        return
                     self._aio_lora(True)                    # power the SX1262 rail FIRST
                     lora.start_meshcore(self._lora_region())
                     self._wire_meshcore()
                     if getattr(lora, "running", False):
                         self._term("[LoRa] MeshCore started", "ok")
                     else:
-                        self._aio_lora(False)
+                        self._cut_lora_rail()
                         self._term("[LoRa] SX1262 init failed (AIO/antenna?)", "warn")
             except Exception as exc:
                 self._term(f"[LoRa] {exc}", "warn")
-        self._thread(run, "lora")
+            finally:
+                self._mesh_switching = False
+        try:
+            self._thread(run, "lora")
+        except Exception:
+            self._mesh_switching = False
+            raise
 
     def _aio_sdr(self, on: bool) -> None:
         """Power the AIO v2 SDR rail on/off — the RTL dongle is dead without it,
@@ -2344,8 +2787,11 @@ class Backend:
         aio = self._mgr("aio")
         try:
             if aio and aio.is_installed():
-                st = aio.get_status() or {}
-                new = not st.get("sdr", False)
+                cur = (aio.get_status() or {}).get("sdr")
+                if not isinstance(cur, bool):     # a toggle needs a real reading
+                    self._term("[SDR] rail state unknown (GPIO read failed) - not toggling", "warn")
+                    return
+                new = not cur
                 aio.toggle("sdr", new)
                 self._sdr_rail = new
                 if not new:
@@ -2483,20 +2929,32 @@ class Backend:
         lora = self._mgr("lora")
         if lora is None:
             self._term("[MC] LoRa manager unavailable", "warn"); return
+        if not self._claim_mesh_op():               # serialized with stack switches
+            self._term("[MC] radio switch already in progress...", "warn"); return
         def run():
             try:
                 if not getattr(lora, "running", False):
+                    holder = self._meshtasticd_holder()
+                    if holder:                      # meshtasticd owns the SX1262
+                        self._report_radio_held(holder, "[MC]")
+                        return
                     self._aio_lora(True)                    # power rail first
                     lora.start_meshcore(self._lora_region())
                 self._wire_meshcore()
                 if getattr(lora, "running", False):
                     self._term("[MC] MeshCore messenger ready", "ok")
                 else:
-                    self._aio_lora(False)
+                    self._cut_lora_rail("[MC]")
                     self._term("[MC] SX1262 init failed (enable AIO/antenna)", "warn")
             except Exception as exc:
                 self._term(f"[MC] {exc}", "warn")
-        self._thread(run, "meshcore")
+            finally:
+                self._mesh_switching = False
+        try:
+            self._thread(run, "meshcore")
+        except Exception:
+            self._mesh_switching = False
+            raise
 
     # ---- Messengers: MeshCore (LoRa) + WDGWars (Reticulum/LXMF) ----
     def _mc_on_message(self, channel, message, rssi=0, hops=0):
@@ -2507,7 +2965,8 @@ class Backend:
         try:                                  # persist to loot (was UI-only before)
             self.ensure_session()
             if self.loot:
-                self.loot.save_meshcore_message(str(channel), str(message), float(rssi or 0))
+                with self._loot_lock:
+                    self.loot.save_meshcore_message(str(channel), str(message), float(rssi or 0))
         except Exception:
             pass
 
@@ -2518,7 +2977,8 @@ class Backend:
         try:                                  # persist DMs too (was UI-only; channel msgs already save)
             self.ensure_session()
             if self.loot:
-                self.loot.save_meshcore_message("DM:" + str(from_id), str(message), float(rssi or 0))
+                with self._loot_lock:
+                    self.loot.save_meshcore_message("DM:" + str(from_id), str(message), float(rssi or 0))
         except Exception:
             pass
 
@@ -2554,9 +3014,10 @@ class Backend:
                     "lat": lat, "lon": lon, "name": nm, "type": ntype}
             self._log_mesh_node(str(node_id), str(ntype), nm, lat, lon, rssi, snr)
             if self.loot:                     # fill the CONTACTS panel/counter (store was never populated)
-                self.loot.save_contact(str(node_id), {"name": nm, "type": ntype,
-                                                      "lat": lat, "lon": lon,
-                                                      "rssi": rssi, "snr": snr})
+                with self._loot_lock:
+                    self.loot.save_contact(str(node_id), {"name": nm, "type": ntype,
+                                                          "lat": lat, "lon": lon,
+                                                          "rssi": rssi, "snr": snr})
         except Exception:
             pass
 
@@ -2567,9 +3028,10 @@ class Backend:
         try:
             self.ensure_session()
             if self.loot:
-                self.loot.save_meshcore_node(node_id, ntype, name,
-                                             float(lat or 0), float(lon or 0),
-                                             float(rssi or 0), float(snr or 0))
+                with self._loot_lock:
+                    self.loot.save_meshcore_node(node_id, ntype, name,
+                                                 float(lat or 0), float(lon or 0),
+                                                 float(rssi or 0), float(snr or 0))
         except Exception:
             pass
 
@@ -2665,23 +3127,96 @@ class Backend:
 
     def start_mesh(self, stack: str) -> None:
         """Switch the active LoRa mesh stack in the background: 'meshcore',
-        'meshtastic', or 'off'. One at a time on the shared SX1262. The chosen
-        stack is recorded immediately so the UI reflects it (ON/OFF comes from the
-        manager's running state)."""
-        if self._mesh_switching:
+        'meshtastic', or 'off'. One at a time on the shared SX1262. The new stack
+        is published (mesh_stack() + settings) only once it is really up; until
+        then the UI keeps showing the previous one."""
+        if not self._claim_mesh_op():
             self._term("[MESH] switch already in progress...", "warn")
             return
-        self._mesh["stack"] = "" if stack == "off" else stack
-        self._save_mesh_settings()
-        self._mesh_switching = True
         def _run():
             try:
                 self._start_mesh(stack)
             finally:
                 self._mesh_switching = False
-        self._thread(_run, "mesh-switch")
+        try:
+            self._thread(_run, "mesh-switch")
+        except Exception:
+            self._mesh_switching = False
+            raise
 
-    def _release_lora_spi(self, release_gpio: bool = False) -> None:
+    def _claim_mesh_op(self) -> bool:
+        """Atomically take the one-at-a-time LoRa switch/retune slot."""
+        with Backend._MESH_GUARD:
+            if getattr(self, "_mesh_switching", False):
+                return False
+            self._mesh_switching = True
+            return True
+
+    def _publish_live_stack(self) -> None:
+        """After a failed or refused switch, publish what is REALLY on the radio."""
+        lora = self._mgrs.get("lora")
+        mt = self._mgrs.get("meshtastic")
+        if lora is not None and getattr(lora, "running", False):
+            live = "meshcore"
+        elif mt is not None and getattr(mt, "running", False):
+            live = "meshtastic"
+        else:
+            live = ""
+        if self._mesh.get("stack", "") != live:
+            self._mesh["stack"] = live
+            self._save_mesh_settings()
+
+    @staticmethod
+    def _meshtasticd_holder() -> str:
+        """'' when no meshtasticd can be holding the SX1262, else who holds it
+        ('meshtasticd (pid 1234)', or the API port when no process is visible).
+        Called after the game stopped its OWN daemon, so whatever is left was not
+        started by the game (or refused to die) and must not lose the radio."""
+        pids = []
+        try:
+            for d in os.listdir("/proc"):
+                if not d.isdigit():
+                    continue
+                try:
+                    with open("/proc/%s/comm" % d) as f:
+                        if f.read().strip() == "meshtasticd":
+                            pids.append(int(d))
+                except OSError:
+                    continue
+        except OSError:
+            pass
+        if pids:
+            return "meshtasticd (pid %s)" % ", ".join(str(x) for x in sorted(pids))
+        try:
+            from watchdogs.meshtastic_manager import MeshtasticManager, MT_API_PORT
+            if MeshtasticManager._port_open():
+                return "a meshtasticd API on port %d" % MT_API_PORT
+        except Exception:
+            pass
+        return ""
+
+    def _report_radio_held(self, holder: str, tag: str = "[MESH]") -> None:
+        self._term("%s SX1262 still held by %s (not stopped by the game) - "
+                   "stop it first (e.g. sudo systemctl stop meshtasticd); "
+                   "nothing switched, LoRa rail left as is" % (tag, holder), "warn")
+        self.set_status("LoRa radio held by %s" % holder)
+
+    def _cut_lora_rail(self, tag: str = "[LoRa]") -> bool:
+        """Power the LoRa rail down unless an outside meshtasticd still uses the
+        SX1262 (cutting it would crash that daemon's radio)."""
+        holder = self._meshtasticd_holder()
+        if holder:
+            self._report_radio_held(holder, tag)
+            return False
+        self._aio_lora(False)
+        return True
+
+    def _report_radio_busy(self, tag: str = "[LoRa]") -> None:
+        self._term("%s radio busy - the MeshCore thread has not exited yet; "
+                   "nothing was switched, try again in a moment" % tag, "warn")
+        self.set_status("LoRa radio busy - try again")
+
+    def _release_lora_spi(self, release_gpio: bool = False) -> bool:
         """Fully release the SX1262 SPI so the other stack (meshtasticd) can claim
         it. LoRaManager.stop() ends the worker but LoRaRF keeps /dev/spidev1.0
         open, which blocks meshtasticd's radio init — close it and drop the
@@ -2693,13 +3228,22 @@ class Backend:
         a fast MeshCore restart). meshtasticd's libgpiod then can't request those
         lines and its SX126x init aborts (gpiod_line_request assertion -> SIGABRT,
         stack shows OFF). Release just those pins (cleanup([...]) keeps the global
-        BCM mode, so a later MeshCore begin() still works)."""
+        BCM mode, so a later MeshCore begin() still works).
+
+        Returns False (and touches nothing: handle, SPI, GPIO and rail stay as
+        they are) when the MeshCore thread did not confirm its exit — stop() is
+        always called on an existing manager, also while its thread is still
+        winding down, so a later retry can wait for it again."""
         lora = self._mgrs.get("lora")
-        try:
-            if lora and getattr(lora, "running", False):
-                lora.stop()
-        except Exception:
-            pass
+        if lora is not None:
+            try:
+                stopped = lora.stop()
+            except Exception as exc:
+                self._term("[LoRa] stop failed: %s" % exc, "warn")
+                stopped = False
+            if stopped is False:
+                self._report_radio_busy()
+                return False
         try:
             from LoRaRF import SX126x as _sx
             _sx.spi.close()
@@ -2717,19 +3261,41 @@ class Backend:
             except Exception:
                 pass
         self._mgrs.pop("lora", None)
+        return True
 
     def _start_mesh(self, stack: str) -> None:
         try:
             mt = self._mgrs.get("meshtastic")
-            if stack != "meshtastic" and mt and getattr(mt, "running", False):
-                mt.stop()
+            if stack != "meshtastic":
+                # The SX1262 must be free of meshtasticd before MeshCore / power-off.
+                # Attached to a daemon the game did not start: disconnecting our
+                # client would not free the radio, so refuse without touching it.
+                if (mt is not None and getattr(mt, "running", False)
+                        and not getattr(mt, "owns_daemon", getattr(mt, "_proc", None) is not None)):
+                    holder = self._meshtasticd_holder()
+                    if holder:
+                        self._report_radio_held(holder)
+                        return
+                if mt is not None and getattr(mt, "running", False):
+                    mt.stop()                            # stops OUR daemon only
+                holder = self._meshtasticd_holder()      # also when our client was idle
+                if holder:
+                    self._report_radio_held(holder)
+                    self._publish_live_stack()
+                    return
             if stack == "off":
-                self._release_lora_spi()
-                self._aio_lora(False)
+                if not self._release_lora_spi():
+                    self._publish_live_stack()
+                    return
+                self._aio_lora(False)                    # holder checked above
+                self._mesh["stack"] = ""
+                self._save_mesh_settings()
                 self._term("[MESH] radio off", "warn")
                 return
             if stack == "meshtastic":
-                self._release_lora_spi(release_gpio=True)  # free SPI + GPIO for meshtasticd
+                if not self._release_lora_spi(release_gpio=True):  # SPI + GPIO for meshtasticd
+                    self._publish_live_stack()
+                    return
                 time.sleep(0.8)
             self._aio_lora(True)                         # power the SX1262 rail
             if stack == "meshcore":
@@ -2745,15 +3311,21 @@ class Backend:
                     self._mesh.get("mt_preset", "LONG_FAST"),
                     owner_long=(self._mesh.get("mt_name") or self.node_name())))
             if ok:
+                self._mesh["stack"] = stack              # publish only once it is up
                 self._mesh["last_stack"] = stack        # remember for auto-resume
                 self._mesh["cfg_mc" if stack == "meshcore" else "cfg_mt"] = True
                 self._save_mesh_settings()
                 self._term("[MESH] %s active" % stack, "ok")
             else:
-                self._aio_lora(False)
+                self._cut_lora_rail("[MESH]")            # not under an outside meshtasticd
                 self._term("[MESH] %s failed to start" % stack, "warn")
+                self._publish_live_stack()
         except Exception as exc:
             self._term("[MESH] %s" % exc, "warn")
+            try:
+                self._publish_live_stack()
+            except Exception:
+                pass
 
     def _lora_rail_on(self) -> bool:
         """True iff the physical AIO LoRa rail (GPIO16) is already powered.
@@ -3112,7 +3684,8 @@ class Backend:
         try:                                  # persist WDGWars chat (was UI-only -> lost on exit)
             self.ensure_session()
             if self.loot:
-                self.loot.save_wdgwars_message(str(nick), str(text))
+                with self._loot_lock:
+                    self.loot.save_wdgwars_message(str(nick), str(text))
         except Exception:
             pass
 
@@ -3126,7 +3699,8 @@ class Backend:
             try:                              # persist our own outgoing chat too
                 self.ensure_session()
                 if self.loot:
-                    self.loot.save_wdgwars_message(str(getattr(wd, "nick", "you")), str(text))
+                    with self._loot_lock:
+                        self.loot.save_wdgwars_message(str(getattr(wd, "nick", "you")), str(text))
             except Exception:
                 pass
         except Exception as exc:
@@ -3152,18 +3726,57 @@ class Backend:
         return self._lora_region()
 
     def mc_set_region(self, key: str) -> None:
+        """Set the MeshCore region. With MeshCore on air the radio is retuned in
+        the background (serialized with stack switches) and the new region is
+        published only after the restart succeeded."""
+        if not self._claim_mesh_op():
+            self._term("[MC] radio switch in progress - region unchanged", "warn")
+            return
+        lora = self._mgrs.get("lora")
+        if not (lora and getattr(lora, "running", False)):
+            try:                                 # nothing on air: just a preference
+                self._commit_mc_region(key)
+                self._term("[MC] region -> " + key, "ok")
+            finally:
+                self._mesh_switching = False
+            return
+        def _run():
+            try:
+                self._retune_meshcore(lora, key)
+            finally:
+                self._mesh_switching = False
+        try:
+            self._thread(_run, "mc-retune")
+        except Exception:
+            self._mesh_switching = False
+            raise
+
+    def _commit_mc_region(self, key: str) -> None:
         self._mc_region = key
         self._mesh["mc_region"] = key          # persist across sessions
         self._save_mesh_settings()
-        lora = self._mgrs.get("lora")
+
+    def _retune_meshcore(self, lora, key: str) -> None:
         try:
-            if lora and getattr(lora, "running", False):
-                lora.stop(); lora.start_meshcore(key); self._wire_meshcore()
-                self._term("[MC] retuned -> " + key, "ok")
-            else:
-                self._term("[MC] region -> " + key, "ok")
+            stopped = lora.stop()
+        except Exception as exc:
+            self._term(f"[MC] retune: stop failed: {exc}", "warn")
+            stopped = False
+        if stopped is False:                   # old thread still on the radio
+            self._report_radio_busy("[MC]")
+            return
+        try:
+            lora.start_meshcore(key)
+            self._wire_meshcore()
         except Exception as exc:
             self._term(f"[MC] retune: {exc}", "warn")
+        if getattr(lora, "running", False):
+            self._commit_mc_region(key)
+            self._term("[MC] retuned -> " + key, "ok")
+        else:
+            self._term("[MC] retune to %s failed - MeshCore stopped (region kept: %s)"
+                       % (key, self._lora_region()), "warn")
+            self._publish_live_stack()
 
     def mc_contacts(self) -> list:
         try:
@@ -3237,6 +3850,30 @@ class Backend:
                         "remove the leading '#' to enable upload." % k)
         return "[WPA-SEC] no key - add WDG_WPASEC_KEY to secrets.conf."
 
+    def _wpasec_blocked_macs(self, loot_dir: Path) -> set[str]:
+        # WhitelistManager.load() logs read errors and can return a partial list.
+        # A missing file is the normal "no ignore list yet" state (same as the
+        # manager) -> no exclusions; a file that exists but cannot be read or
+        # parsed still raises, so the upload stops instead of ignoring the list.
+        path = loot_dir / "whitelist.json"
+        rows = []
+        if path.exists():
+            with path.open(encoding="utf-8") as fh:
+                rows = json.load(fh)
+        if not isinstance(rows, list):
+            raise ValueError("expected a list")
+        macs = [row["mac"] for row in rows]
+        if self._wl is not None:
+            # An in-memory addition still applies if the manager failed to save it.
+            macs.extend(entry.mac for entry in self._wl.entries)
+        blocked = set()
+        for mac in macs:
+            digits = mac.strip().replace(":", "").replace("-", "").upper()
+            if not re.fullmatch(r"[0-9A-F]{12}", digits):
+                raise ValueError("invalid MAC address")
+            blocked.add(":".join(digits[i:i + 2] for i in range(0, 12, 2)))
+        return blocked
+
     def _act_wpasec_up(self):
         if not HAVE_BACKEND:
             return
@@ -3244,7 +3881,12 @@ class Backend:
         def run():
             try:
                 loot_dir = Path(self._app_dir) / "loot"
-                up, total, msg = UM.upload_wpasec_all(loot_dir)
+                try:
+                    blocked_macs = self._wpasec_blocked_macs(loot_dir)
+                except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+                    self._term(f"[WPA-SEC] upload stopped: cannot read ignore list: {exc}", "warn")
+                    return
+                up, total, msg = UM.upload_wpasec_all(loot_dir, blocked_macs=blocked_macs)
                 if "not configured" in msg.lower():
                     self._term(self._wpasec_key_msg(), "warn")
                 else:
@@ -3288,18 +3930,29 @@ class Backend:
                         "remove the leading '#' to enable upload." % k)
         return "[WiGLE] no key - add WDG_WIGLE_NAME + WDG_WIGLE_TOKEN to secrets.conf."
 
-    def _act_wigle_up(self):
+    def _act_wigle_up(self, quiet_unconfigured: bool = False):
         if not HAVE_BACKEND:
             return
         from watchdogs import upload_manager as UM
         def run():
+            # One WiGLE upload at a time across BOTH entry points (menu + cluster
+            # auto-upload), else the same session can be sent twice and burn quota.
+            if not self._wigle_lock.acquire(blocking=False):
+                if not quiet_unconfigured:
+                    self._term("[WiGLE] an upload is already running", "warn")
+                return
             try:
                 if not UM.wigle_configured():
-                    self._term(self._wigle_key_msg(), "warn")
+                    if not quiet_unconfigured:
+                        self._term(self._wigle_key_msg(), "warn")
                     return
                 loot_dir = Path(self._app_dir) / "loot"
                 self._term("[WiGLE] uploading wardriving sessions...", "tx")
-                up, total, msg = UM.upload_wigle_all(loot_dir, self._app_dir)
+                try:
+                    active = self.loot._session.name if self.loot and self.loot._session else ""
+                except Exception:                    # noqa: BLE001
+                    active = ""
+                up, total, msg = UM.upload_wigle_all(loot_dir, self._app_dir, keep_pending=active)
                 if "not configured" in msg.lower():
                     self._term(self._wigle_key_msg(), "warn")
                 else:
@@ -3307,6 +3960,8 @@ class Backend:
                                "ok" if up else "warn")
             except Exception as exc:
                 self._term("[WiGLE] upload: %s" % exc, "warn")
+            finally:
+                self._wigle_lock.release()
         self._thread(run, "wigle-up")
 
     # ---- flash / update ----
@@ -3406,6 +4061,14 @@ class Backend:
         if not port:
             raise self._FlashError(
                 "no ESP32 serial port found - plug the board in, then press ENTER")
+        # Bind the whole run to THIS board's USB identity so a USB power-cycle or a
+        # second ESP32-C5 (XIAO + Monster RF, etc.) can never divert the write to a
+        # different board. '' identity = chip exposes none; we then simply never
+        # auto-switch away from the chosen port.
+        flash_ident = self._port_identity(port)
+        if flash_ident[0] or flash_ident[1]:
+            self._term("[FLASH] bound to %s (id %s)"
+                       % (port, flash_ident[0] or flash_ident[1]), "tx")
         released = written = False
         try:
             # ---- from here the flasher OWNS the port (connect() is blocked) ----
@@ -3422,9 +4085,15 @@ class Backend:
                 if use_rail:
                     self._term("[FLASH] USB power cycle...", "tx")
                     aio.toggle("usb", False); time.sleep(2); aio.toggle("usb", True)
-                    port = self._wait_port(port, 6.0)
-                else:
-                    port = detect_esp32_port() or port
+                    port = self._wait_identity(flash_ident, port, 6.0)
+                elif flash_ident[0] or flash_ident[1]:
+                    # Re-resolve the SAME board only (never jump to another ESP32).
+                    port = self._find_by_identity(flash_ident) or ""
+                # else: no stable id -> keep the originally selected port as-is.
+                if not port or not Path(port).exists():
+                    raise self._FlashError(
+                        "the selected ESP32 disappeared before writing - nothing was "
+                        "flashed. Reconnect the SAME board and press ENTER.")
                 after = "no-reset" if use_rail else "hard-reset"
                 cmd = [sys.executable, "-m", "esptool", "-p", port, "-b", str(baud),
                        "--before", profile["before"], "--after", after, "--chip", "esp32c5",
@@ -3552,6 +4221,57 @@ class Backend:
                 return p
             time.sleep(0.2)
         return port
+
+    @staticmethod
+    def _port_identity(dev: str):
+        """(serial_number, usb_location) for a device path. Either may be '' on
+        chips that don't expose it. Used to re-bind to the SAME physical board
+        across USB power-cycles instead of grabbing whatever ESP32 is visible."""
+        try:
+            import serial.tools.list_ports as _lp
+            for p in _lp.comports():
+                if p.device == dev:
+                    return (getattr(p, "serial_number", None) or "",
+                            getattr(p, "location", None) or "")
+        except Exception:
+            pass
+        return ("", "")
+
+    @staticmethod
+    def _find_by_identity(ident) -> str:
+        """Device path whose USB identity matches `ident` (serial first, then USB
+        topology location). '' when the selected board is not present."""
+        sn, loc = ident
+        if not (sn or loc):
+            return ""
+        try:
+            import serial.tools.list_ports as _lp
+            ports = list(_lp.comports())
+        except Exception:
+            return ""
+        if sn:
+            for p in ports:
+                if (getattr(p, "serial_number", None) or "") == sn:
+                    return p.device
+        if loc:
+            for p in ports:
+                if (getattr(p, "location", None) or "") == loc:
+                    return p.device
+        return ""
+
+    def _wait_identity(self, ident, fallback: str, secs: float) -> str:
+        """Wait up to `secs` for the SELECTED board (by USB identity) to reappear.
+        Returns its current path, or '' if it never comes back. When the board has
+        no stable identity, fall back to the plain port wait."""
+        if not (ident[0] or ident[1]):
+            return self._wait_port(fallback, secs)
+        end = time.time() + secs
+        while time.time() < end:
+            dev = self._find_by_identity(ident)
+            if dev:
+                return dev
+            time.sleep(0.2)
+        return ""
 
     def _flash_fetch(self, board: str, profile: dict):
         """Latest release -> download the board zip -> VERIFY (GitHub sha256 digest,
@@ -3793,8 +4513,11 @@ class Backend:
         aio = self._mgr("aio")
         try:
             if aio and aio.is_installed():
-                st = aio.get_status() or {}
-                new = not st.get("usb", False)
+                cur = (aio.get_status() or {}).get("usb")
+                if not isinstance(cur, bool):     # a toggle needs a real reading
+                    self._term("[USB] rail state unknown (GPIO read failed) - not toggling", "warn")
+                    return
+                new = not cur
                 aio.toggle("usb", new)
                 self._term("[USB] " + ("on" if new else "off"), "ok")
             else:
@@ -3811,14 +4534,7 @@ class Backend:
             self._term("[MC] region presets unavailable", "warn"); return
         cur = getattr(self, "_mc_region", keys[0])
         nxt = keys[(keys.index(cur) + 1) % len(keys)] if cur in keys else keys[0]
-        self._mc_region = nxt
-        self._term("[MC] region -> " + nxt, "ok")
-        lora = self._mgrs.get("lora")
-        if lora is not None and getattr(lora, "running", False):
-            try:
-                lora.stop(); lora.start_meshcore(nxt)
-            except Exception:
-                pass
+        self.mc_set_region(nxt)       # same guarded retune + publish-after-success path
 
     def _act_prox(self):
         p = self._mgr("prox")
@@ -3910,6 +4626,17 @@ class Backend:
             return p.meeting() if p else None
         except Exception:
             return None
+
+    def prox_strangers(self) -> list:
+        """Unresolved WDG peers labelled <Model>-XXXX (radar list only; the
+        pager/HUD keep treating them as 'unknown')."""
+        if getattr(self, "_demo_prox", None):
+            return []
+        p = self._mgrs.get("prox")
+        try:
+            return list(p.strangers()) if p and hasattr(p, "strangers") else []
+        except Exception:
+            return []
 
     def prox_unknown(self) -> int:
         p = self._mgrs.get("prox")
@@ -4186,37 +4913,94 @@ class Backend:
         self._backup_busy = True
         def run():
             try:
-                import tarfile
+                import tarfile, tempfile
                 ts = time.strftime("%Y-%m-%d_%H-%M-%S")
                 home = self._user_home()
-                out = os.path.join(home, "wdgo-backup-%s.tar.gz" % ts)
+                final = os.path.join(home, "wdgo-backup-%s.tar.gz" % ts)
                 loot = os.path.join(self._app_dir, "loot")
                 secrets = os.path.join(self._app_dir, "secrets.conf")
                 self._term("[DATA] exporting backup...", "tx")
-                with tarfile.open(out, "w:gz") as tar:
-                    if os.path.isdir(loot):
-                        tar.add(loot, arcname="loot")
-                    if os.path.isfile(secrets):
-                        tar.add(secrets, arcname="secrets.conf")
-                self._chown_user(out)
-                mb = os.path.getsize(out) / 1e6
-                self._backup_path = out
-                self._term("[DATA] backup saved: %s (%.1f MB)" % (out, mb), "ok")
+                # Create a UNIQUE private file on a fresh descriptor: O_EXCL (mkstemp)
+                # never follows a symlink or truncates an existing file, and 0600 keeps
+                # the bundled secrets.conf + chat identity unreadable to other accounts
+                # under umask 022. Everything is written and chowned through the SAME
+                # fd (no path re-resolution), and only published under the final name
+                # after a clean close.
+                fd, tmp = tempfile.mkstemp(prefix=".wdgo-backup-%s-" % ts,
+                                           suffix=".part", dir=home)
+                try:
+                    os.fchmod(fd, 0o600)
+                    try:                     # hand to the login user via the fd itself
+                        if os.geteuid() == 0 and os.environ.get("SUDO_UID"):
+                            uid = int(os.environ["SUDO_UID"])
+                            gid = int(os.environ.get("SUDO_GID", uid))
+                            os.fchown(fd, uid, gid)
+                    except Exception:
+                        pass
+                    rawf = os.fdopen(fd, "wb")
+                    fd = -1                   # fdopen owns the descriptor now
+                    with rawf:
+                        with tarfile.open(fileobj=rawf, mode="w:gz") as tar:
+                            if os.path.isdir(loot):
+                                tar.add(loot, arcname="loot")
+                            if os.path.isfile(secrets):
+                                tar.add(secrets, arcname="secrets.conf")
+                    os.replace(tmp, final)    # atomic publish after the archive is closed
+                    tmp = None
+                finally:
+                    if fd != -1:
+                        try: os.close(fd)
+                        except Exception: pass
+                    if tmp and os.path.exists(tmp):
+                        try: os.unlink(tmp)
+                        except Exception: pass
+                mb = os.path.getsize(final) / 1e6
+                self._backup_path = final
+                self._term("[DATA] backup saved: %s (%.1f MB)" % (final, mb), "ok")
             except Exception as exc:
                 self._term("[DATA] backup failed: %s" % exc, "warn")
             finally:
                 self._backup_busy = False
         self._thread(run, "backup")
 
+    @staticmethod
+    def _safe_backup_member(m) -> bool:
+        """Accept ONLY regular files/dirs under loot/ or a single top-level
+        secrets.conf. Reject symlinks/hardlinks/devices, absolute paths, '..'
+        escapes and anything else — enforced on EVERY Python version (no reliance
+        on tar's data filter), so a crafted archive can never write app code."""
+        name = m.name or ""
+        if name.startswith("/") or "\\" in name or "\x00" in name:
+            return False
+        parts = [p for p in name.split("/") if p not in ("", ".")]
+        if not parts or any(p == ".." for p in parts):
+            return False
+        if os.path.isabs(os.path.normpath(name)):
+            return False
+        if not (m.isreg() or m.isdir()):     # no links/devices/fifos
+            return False
+        top = parts[0]
+        if top == "secrets.conf":
+            return len(parts) == 1 and m.isreg()
+        return top == "loot"
+
     def import_userdata(self) -> None:
-        """Restore the newest ~/wdgo-backup-*.tar.gz, then relaunch to apply."""
+        """Restore the newest ~/wdgo-backup-*.tar.gz, then relaunch to apply.
+
+        The archive is extracted into a private temp dir and fully validated BEFORE
+        the live loot/ and secrets.conf are touched, so a truncated or hostile
+        backup can never delete or overwrite good data. The previous data is kept as
+        *.pre-restore until success. The in-memory loot manager is frozen + detached
+        first so its db can't be written over the restored files during the restart."""
         if self._backup_busy:
             return
         self._backup_busy = True
         def run():
+            import tarfile, glob, shutil, tempfile
             restored = False
+            tmpdir = None
+            froze = False
             try:
-                import tarfile, glob, shutil
                 home = self._user_home()
                 cands = sorted(glob.glob(os.path.join(home, "wdgo-backup-*.tar.gz")))
                 if not cands:
@@ -4224,24 +5008,74 @@ class Backend:
                     return
                 src = cands[-1]
                 self._term("[DATA] restoring %s ..." % os.path.basename(src), "tx")
-                loot = os.path.join(self._app_dir, "loot")
-                if os.path.isdir(loot):
-                    bak = loot + ".pre-restore"
-                    shutil.rmtree(bak, ignore_errors=True)
-                    shutil.move(loot, bak)   # keep the replaced data as an undo
+
+                # 1) Extract into a PRIVATE temp dir, member by member, validated.
+                tmpdir = tempfile.mkdtemp(prefix=".wdgo-restore-", dir=self._app_dir)
                 with tarfile.open(src, "r:gz") as tar:
+                    for m in tar.getmembers():
+                        if not self._safe_backup_member(m):
+                            raise ValueError("unsafe archive entry: %r" % (m.name,))
+                        # set_attrs=False: don't let the archive dictate mode/owner
+                        # (e.g. a setuid bit); names validated, so it stays in tmpdir.
+                        tar.extract(m, tmpdir, set_attrs=False)
+                new_loot = os.path.join(tmpdir, "loot")
+                new_secrets = os.path.join(tmpdir, "secrets.conf")
+                if not (os.path.isdir(new_loot) or os.path.isfile(new_secrets)):
+                    raise ValueError("backup has no loot/ or secrets.conf")
+
+                # 2) Freeze loot production + detach the live manager so neither the
+                #    periodic save nor the restart teardown can write its stale db
+                #    over the data we are about to restore.
+                self._loot_frozen = True
+                froze = True
+                old_mgr = self.loot
+                self.loot = None
+                if old_mgr is not None:
+                    try: old_mgr.close()     # its final write lands in the pre-restore undo
+                    except Exception: pass
+
+                # 3) Swap in, each piece with its own rollback. Validation already
+                #    passed, so this is the only step that mutates live data.
+                def _swap_in(src_path, dst_path, is_dir):
+                    bak = dst_path + ".pre-restore"
+                    if is_dir:
+                        shutil.rmtree(bak, ignore_errors=True)
+                    elif os.path.lexists(bak):
+                        os.remove(bak)
+                    had = os.path.lexists(dst_path)
+                    if had:
+                        shutil.move(dst_path, bak)   # keep old data as undo
                     try:
-                        tar.extractall(self._app_dir, filter="data")
-                    except TypeError:        # older Python without the filter kwarg
-                        tar.extractall(self._app_dir)
-                self._term("[DATA] restored (old data kept at loot.pre-restore) - restarting...", "ok")
-                restored = True
+                        shutil.move(src_path, dst_path)
+                    except Exception:
+                        if had:                      # restore the original on failure
+                            if os.path.lexists(dst_path):
+                                (shutil.rmtree(dst_path, ignore_errors=True)
+                                 if is_dir else os.remove(dst_path))
+                            shutil.move(bak, dst_path)
+                        raise
+
+                loot_dir = os.path.join(self._app_dir, "loot")
+                sec_file = os.path.join(self._app_dir, "secrets.conf")
+                if os.path.isdir(new_loot):
+                    _swap_in(new_loot, loot_dir, True)
+                restored = True                      # loot (or secrets-only) is now in place
+                if os.path.isfile(new_secrets):
+                    try:
+                        _swap_in(new_secrets, sec_file, False)
+                    except Exception as exc:
+                        self._term("[DATA] secrets.conf not restored: %s" % exc, "warn")
+                self._term("[DATA] restored (previous data kept at *.pre-restore) - restarting...", "ok")
             except Exception as exc:
-                self._term("[DATA] restore failed: %s" % exc, "warn")
+                self._term("[DATA] restore failed - data left unchanged: %s" % exc, "warn")
+                if froze and not restored:
+                    self._loot_frozen = False        # recover: nothing was swapped
             finally:
+                if tmpdir and os.path.isdir(tmpdir):
+                    shutil.rmtree(tmpdir, ignore_errors=True)
                 self._backup_busy = False
                 if restored:
-                    self._game_restart = True
+                    self._game_restart = True        # UI re-execs with the restored data
         self._thread(run, "restore")
 
     # ---- Flipper ----
@@ -4313,9 +5147,22 @@ class Backend:
     # ---- Watch (PipBoy) ----
     def watch_scan(self) -> None:
         w = self._mgr("watch")
-        if w:
-            try: w.scan(); self.watch_log.append("[WATCH] scanning...")
-            except Exception as exc: self.watch_log.append("err: %s" % exc)
+        if not w:
+            return
+        # w.scan() does blocking bluetoothctl calls (5 s timeouts + a 3 s settle), so
+        # run it OFF the UI loop and refuse a duplicate while one is already running.
+        if getattr(self, "_watch_scan_busy", False):
+            return
+        self._watch_scan_busy = True
+        def run():
+            try:
+                self.watch_log.append("[WATCH] scanning...")
+                w.scan()
+            except Exception as exc:
+                self.watch_log.append("err: %s" % exc)
+            finally:
+                self._watch_scan_busy = False
+        self._thread(run, "watch-scan")
 
     def watch_connected(self) -> bool:
         w = self._mgrs.get("watch"); return bool(w and getattr(w, "connected", False))
@@ -4323,10 +5170,23 @@ class Backend:
     def watch_scanning(self) -> bool:
         w = self._mgrs.get("watch"); return bool(w and getattr(w, "scanning", False))
 
+    def _watch_contract_error(self, what: str, exc: Exception) -> None:
+        """Report a WatchManager API mismatch ONCE (this is polled every frame), so
+        a broken contract shows up in the terminal instead of as a silent empty list."""
+        seen = self.__dict__.setdefault("_watch_errs", set())
+        if what not in seen:
+            seen.add(what)
+            self._term("[WATCH] %s unavailable: %s" % (what, exc), "err")
+
     def watch_results(self) -> list:
         w = self._mgrs.get("watch")
-        try: return list(w.scan_results()) if w else []
-        except Exception: return []
+        if w is None:
+            return []
+        try:
+            return list(w.scan_results)          # property on WatchManager
+        except Exception as exc:
+            self._watch_contract_error("scan_results", exc)
+            return []
 
     def watch_connect(self, addr: str) -> None:
         w = self._mgr("watch")
@@ -4336,8 +5196,13 @@ class Backend:
 
     def watch_pin_requested(self) -> bool:
         w = self._mgrs.get("watch")
-        try: return bool(w and w.pin_requested()) if w else False
-        except Exception: return False
+        if w is None:
+            return False
+        try:
+            return bool(w.pin_requested)         # property on WatchManager
+        except Exception as exc:
+            self._watch_contract_error("pin_requested", exc)
+            return False
 
     def watch_provide_pin(self, pin: int) -> None:
         w = self._mgrs.get("watch")
@@ -4440,19 +5305,29 @@ class Backend:
         — scans loot/*/wardriving.csv + bt_devices.csv WITHOUT creating a LootManager
         write-session (reuses LootManager.get_gps_points on a tiny read-only stand-in)."""
         now = time.time()
-        if now - self._loot_points_ts > 30:
+        # Stale-while-revalidate: the scan walks every loot/*/ CSV and can take a
+        # while on an SD card, so do it in the BACKGROUND and keep returning the last
+        # complete list — the frame thread never blocks on disk.
+        if (now - self._loot_points_ts > 30
+                and not getattr(self, "_loot_points_building", False)):
             self._loot_points_ts = now
-            try:
-                from watchdogs.loot_manager import LootManager
+            self._loot_points_building = True
+            app_dir = self._app_dir
+            def _refresh():
+                try:
+                    from watchdogs.loot_manager import LootManager
 
-                class _RO:
-                    _base = Path(self._app_dir) / "loot"
-                    _gps_points_cache = None
-                    _gps_points_ts = 0.0
-                self._loot_points_cache = LootManager.get_gps_points(_RO()) or []
-            except Exception as exc:
-                self._term("[MAP] loot points unavailable: %s" % exc, "warn")
-                self._loot_points_cache = []
+                    class _RO:
+                        _base = Path(app_dir) / "loot"
+                        _gps_points_cache = None
+                        _gps_points_ts = 0.0
+                    self._loot_points_cache = LootManager.get_gps_points(_RO()) or []
+                except Exception as exc:
+                    self._term("[MAP] loot points unavailable: %s" % exc, "warn")
+                    # keep the previous cache rather than blanking the map
+                finally:
+                    self._loot_points_building = False
+            self._thread(_refresh, "lootpts")
         return self._loot_points_cache
 
     def check_fw_update(self) -> None:
@@ -4503,10 +5378,16 @@ class Backend:
     # Data accessors for the UI
     # ------------------------------------------------------------------
 
-    def networks(self) -> list:
-        if self.state:
-            return list(self.state.networks)
-        return list(getattr(self, "_demo_nets", []))
+    def networks(self, limit=None) -> list:
+        import itertools
+        src = self.state.networks if self.state else getattr(self, "_demo_nets", [])
+        if limit is not None:
+            return list(itertools.islice(src, max(0, int(limit))))
+        return list(src)
+
+    def network_count(self) -> int:
+        src = self.state.networks if self.state else getattr(self, "_demo_nets", [])
+        return len(src)
 
     def totals(self) -> dict:
         if self.loot:
@@ -4537,23 +5418,43 @@ class Backend:
                 hs = 0
         # wardriving.csv (WiGLE 1.6) holds BOTH WiFi and BLE rows — split them by
         # the Type column (the last field) instead of counting the whole file as WiFi.
-        wd_wifi = wd_ble = 0
+        # BLE MACs go into a set so a device recorded in BOTH wardriving.csv and
+        # bt_devices.csv is counted ONCE (union), not twice.
+        wd_wifi = 0
+        ble_macs: set = set()
         try:
             with open(d / "wardriving.csv", encoding="utf-8", errors="replace") as f:
                 for ln in f:
-                    t = ln.rstrip("\r\n").rsplit(",", 1)[-1].strip().upper()
+                    fields = ln.rstrip("\r\n").split(",")
+                    t = fields[-1].strip().upper() if fields else ""
                     if t == "BLE":
-                        wd_ble += 1
+                        mac = fields[0].strip().upper()
+                        if ":" in mac:
+                            ble_macs.add(mac)
                     elif t == "WIFI":
                         wd_wifi += 1
         except Exception:
             pass
+        try:
+            with open(d / "bt_devices.csv", encoding="utf-8", errors="replace") as f:
+                for i, ln in enumerate(f):
+                    if i == 0:
+                        continue                 # header
+                    mac = ln.split(",", 1)[0].strip().upper()
+                    if ":" in mac:
+                        ble_macs.add(mac)
+        except Exception:
+            pass
         return {
             "wifi": wd_wifi,
-            "bt": wd_ble + _data_lines("bt_devices.csv", 1),
+            "bt": len(ble_macs),
             "hs": hs,
             "mc": _data_lines("meshcore_nodes.csv", 1),
             "adsb": self._adsb_unique(d / "adsb_aircraft.csv"),
+            # Sessions with ONLY SDR alerts or ONLY mesh messages were hidden before
+            # (n==0); count these so their files stay reachable from the journal.
+            "mc_msgs": _data_lines("meshcore_messages.log", 0),   # no header
+            "emergency": _data_lines("emergency_rf.csv", 1),
         }
 
     def _adsb_unique(self, path) -> int:
@@ -4587,11 +5488,13 @@ class Backend:
             base = Path(self._app_dir) / "loot"
             if base.is_dir():
                 dirs = [p for p in base.iterdir()
-                        if p.is_dir() and len(p.name) >= 10 and p.name[:4].isdigit()]
+                        if p.is_dir() and not p.is_symlink()      # never index a symlinked session
+                        and len(p.name) >= 10 and p.name[:4].isdigit()]
                 for d in sorted(dirs, key=lambda p: p.name, reverse=True):
                     c = self._session_counts(d)
                     out.append({"name": d.name, "counts": c,
-                                "n": c["wifi"] + c["bt"] + c["hs"] + c["mc"] + c["adsb"]})
+                                "n": (c["wifi"] + c["bt"] + c["hs"] + c["mc"] + c["adsb"]
+                                      + c["mc_msgs"] + c["emergency"])})
         except Exception:
             pass
         # The journal is an EVENT log: keep only sessions that captured something
@@ -4675,8 +5578,12 @@ class Backend:
     def session_files(self, name: str) -> list:
         """Files inside one session dir, for the drill-in view: [{name, size}]."""
         out = []
-        base = Path(self._app_dir) / "loot" / name
-        if not base.is_dir():
+        root = (Path(self._app_dir) / "loot").resolve()
+        sess = Path(self._app_dir) / "loot" / name
+        if sess.is_symlink():                      # never follow a symlinked session
+            return out
+        base = sess.resolve()
+        if base.parent != root or not base.is_dir():
             return out
         try:
             for root, _dirs, files in os.walk(base):
@@ -4695,10 +5602,18 @@ class Backend:
     def file_preview(self, name: str, rel: str, max_bytes: int = 65536) -> dict:
         """Preview one file inside a session: text lines, or a hex dump for binary.
         Returns {kind: text|binary|error, lines: [...], size, truncated}."""
-        base = (Path(self._app_dir) / "loot" / name).resolve()
+        root = (Path(self._app_dir) / "loot").resolve()
+        sess = Path(self._app_dir) / "loot" / name
+        if sess.is_symlink():                         # never read through a symlinked session
+            return {"kind": "error", "lines": ["symlinked session refused"], "size": 0}
+        base = sess.resolve()
+        if base.parent != root or not base.is_dir():
+            return {"kind": "error", "lines": ["invalid session"], "size": 0}
         try:
             fp = (base / rel).resolve()
-            if not str(fp).startswith(str(base)):     # path-escape guard
+            # path-component check (not startswith): a sibling like loot/<name>-x must
+            # not pass, and a symlink pointing outside resolves out of base and fails.
+            if not fp.is_relative_to(base):
                 return {"kind": "error", "lines": ["invalid path"], "size": 0}
             if not fp.is_file():
                 return {"kind": "error", "lines": ["not a file"], "size": 0}
@@ -4763,8 +5678,11 @@ class Backend:
 
     def session_size(self, name: str) -> int:
         """Total bytes on disk for one session dir (0 on any error)."""
-        base = (Path(self._app_dir) / "loot" / name).resolve()
         root = (Path(self._app_dir) / "loot").resolve()
+        sess = Path(self._app_dir) / "loot" / name
+        if sess.is_symlink():
+            return 0
+        base = sess.resolve()
         if base.parent != root or not base.is_dir():
             return 0
         total = 0
@@ -4785,13 +5703,26 @@ class Backend:
         This erases capture data for good — the UI confirms before calling it."""
         if not name:
             return False, "no session selected"
-        if name == self.active_session_name():
-            return False, "active session - stop recording first"
         root = (Path(self._app_dir) / "loot").resolve()
-        target = (root / name).resolve()
-        # must be a direct child of loot/ and actually exist
+        link = Path(self._app_dir) / "loot" / name
+        # A symlinked "session" could point at the real active session (or anywhere):
+        # refuse it outright instead of resolving and deleting its target.
+        if link.is_symlink():
+            return False, "symlinked session refused"
+        target = link.resolve()
+        # must be a direct, real child of loot/ and actually a dir
         if target.parent != root or not target.is_dir():
             return False, "invalid session"
+        # Compare REAL paths with the active session so a crafted name can't delete it.
+        act = self.active_session_name()
+        if name == act:
+            return False, "active session - stop recording first"
+        if act:
+            try:
+                if target == (Path(self._app_dir) / "loot" / act).resolve():
+                    return False, "active session - stop recording first"
+            except Exception:
+                pass
         import shutil as _shutil
         try:
             _shutil.rmtree(target)
@@ -4851,12 +5782,18 @@ class Backend:
         return len(self.state.networks) if self.state else 0
 
     def contacts_count(self) -> int:
-        try:
-            p = Path(self._app_dir) / "loot" / "loot_db.json"
-            with open(p, encoding="utf-8") as f:
-                return len(json.load(f).get("mc_contacts", {}))
-        except Exception:
-            return 0
+        # The LOOT screen reads this every frame, so cache it (3 s TTL) instead of
+        # opening + parsing loot_db.json on each render.
+        now = time.time()
+        if now - getattr(self, "_contacts_ct_ts", 0.0) > 3.0:
+            self._contacts_ct_ts = now
+            try:
+                p = Path(self._app_dir) / "loot" / "loot_db.json"
+                with open(p, encoding="utf-8") as f:
+                    self._contacts_ct = len(json.load(f).get("mc_contacts", {}))
+            except Exception:
+                self._contacts_ct = getattr(self, "_contacts_ct", 0)
+        return getattr(self, "_contacts_ct", 0)
 
     def consume_scan_done(self) -> bool:
         """One-shot: True once after a WiFi scan finishes (for UI feedback)."""

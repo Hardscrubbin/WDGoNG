@@ -58,19 +58,31 @@ def _read_receiver(session_dir):
 
 
 def _wardriving_fix(session_dir):
-    """Median position of the session's own wardriving rows, or None."""
+    """Median position of the session's own wardriving rows, or None.
+
+    Header-aware: locate CurrentLatitude/CurrentLongitude by name, not by a fixed
+    index. The old positional p[6]/p[7] read RSSI as the latitude on WiGLE 1.6
+    (the Frequency column shifted everything right), and a comma inside a quoted
+    SSID shifted the fields even on 1.4 (#19)."""
+    from watchdogs import wigle
+    rows = wigle.parse_file(os.path.join(session_dir, "wardriving.csv"))
+    if not rows:
+        return None
     lats, lons = [], []
-    try:
-        with open(os.path.join(session_dir, "wardriving.csv"), encoding="utf-8", errors="replace") as f:
-            for ln in f:
-                p = ln.split(",")
-                if len(p) > 7:
-                    lat, lon = _f(p[6], None), _f(p[7], None)
-                    if lat and lon and -90 <= lat <= 90 and -180 <= lon <= 180:
-                        lats.append(lat)
-                        lons.append(lon)
-    except OSError:
-        pass
+    for parts, cmap in rows:
+        slat = wigle.get(parts, cmap, "CurrentLatitude").strip()
+        slon = wigle.get(parts, cmap, "CurrentLongitude").strip()
+        if not slat or not slon:
+            continue
+        try:
+            lat, lon = float(slat), float(slon)
+        except ValueError:
+            continue
+        # Accept a genuine point on the equator / prime meridian, reject only the
+        # 0,0 "no fix" sentinel and out-of-range values.
+        if -90 <= lat <= 90 and -180 <= lon <= 180 and not (lat == 0.0 and lon == 0.0):
+            lats.append(lat)
+            lons.append(lon)
     return (statistics.median(lats), statistics.median(lons)) if lats else None
 
 
