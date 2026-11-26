@@ -1215,8 +1215,10 @@ def main():
             if is_key_pressed(KEY_ZERO) or is_key_pressed(KEY_KP_0):
                 zoom = 1.0; map_pan[0] = map_pan[1] = 0.0          # recenter on YOU + reset zoom
             # D-pad pans the map to explore away from your position (0 recenters).
-            # Only on the bare map — loot/cluster/data screens use the arrows themselves.
-            if not loot_screen and not cluster_screen and not data_screen and not prox_screen:
+            # Only on the bare map — loot/cluster/data screens and the radio, mesh and
+            # evil twin pickers use the arrows themselves.
+            if (not loot_screen and not cluster_screen and not data_screen and not prox_screen
+                    and not radio_screen and not mesh_screen and not et_screen):
                 _ps = 12.0 / (9000.0 * max(0.0004, zoom))          # ~12 px/frame, in degrees (screen-constant)
                 if is_key_down(KEY_UP):    map_pan[0] += _ps
                 if is_key_down(KEY_DOWN):  map_pan[0] -= _ps
