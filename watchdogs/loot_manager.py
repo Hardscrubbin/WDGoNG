@@ -991,10 +991,14 @@ class LootManager:
                     return False  # existing observation is stronger or equal
                 self._wd_lines[old_idx] = new_row
                 self._wd_index[key_mac] = (old_idx, rssi_val)
+                # Opening the CSV itself with "w" empties it first, so a power cut mid-write
+                # would lose the session. Write a temp file and rename it over (as _save_db does).
+                tmp = path.with_name(path.name + ".tmp")
                 try:
-                    with open(path, "w", newline="", encoding="utf-8") as fh:
+                    with open(tmp, "w", newline="", encoding="utf-8") as fh:
                         fh.writelines(self._wd_lines)
                         _fsync_file(fh)
+                    tmp.replace(path)
                 except OSError as exc:
                     log.error("Cannot update wardriving CSV: %s", exc)
                 return True
