@@ -2963,6 +2963,11 @@ def main():
                 draw_rectangle(bxx + 26, sy + 15, 2, 8, bcol)
                 draw_rectangle(bxx + 2, sy + 14, int(22 * bpct / 100), 10, bcol)
             text(mono, ("%.2fV" % (bmv / 1000.0)) if low_v else ("%d%%" % bpct), bxx + 34, sy + 11, 16, bcol)
+            # app version, tucked just left of the battery when the bar has room
+            _vtxt = "v%s" % bk.game_version()
+            _vx = bxx - 14 - tw(mono, _vtxt, 14)
+            if _vx > 340:
+                text(mono, _vtxt, _vx, sy + 12, 14, DIM)
 
         # key hints — tucked UNDER the brand + module chips (not crammed above
         # them), in TXT so they actually read against the bar
