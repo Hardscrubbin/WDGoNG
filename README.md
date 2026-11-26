@@ -12,6 +12,7 @@
 <img src="https://img.shields.io/badge/built%20with-raylib%20%2B%20Python-8A2BE2?style=for-the-badge&labelColor=0B0E14" alt="built with"/>
 </p>
 <p>
+<a href="https://locosp.github.io/WDGoNG/"><img src="https://img.shields.io/badge/website-locosp.github.io%2FWDGoNG-FFD400?style=for-the-badge&logo=githubpages&logoColor=black&labelColor=0B0E14" alt="website"/></a>
 <a href="https://github.com/LOCOSP/projectZero"><img src="https://img.shields.io/badge/firmware-projectZero-00E5FF?style=for-the-badge&logo=github&logoColor=white&labelColor=0B0E14" alt="firmware"/></a>
 <a href="https://github.com/LOCOSP/WDGWMarauderV8"><img src="https://img.shields.io/badge/fleet-Marauder%20V8-FF2D95?style=for-the-badge&logo=github&logoColor=white&labelColor=0B0E14" alt="fleet"/></a>
 <a href="https://locosp.github.io/WDGoNG-HUB/"><img src="https://img.shields.io/badge/EXTRAS-Hub-00FF9C?style=for-the-badge&logo=githubpages&logoColor=black&labelColor=0B0E14" alt="extras hub"/></a>
