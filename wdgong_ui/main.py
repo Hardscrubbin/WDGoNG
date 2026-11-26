@@ -621,7 +621,7 @@ def main():
         nonlocal comp_screen, comp_sel, comp_scroll, cluster_screen, pair_screen
         nonlocal active_extra, _extras, sel
         nonlocal loot_screen, loot_detail, loot_preview, loot_log_sel, data_screen
-        nonlocal mesh_screen, mesh_sel, mesh_pick
+        nonlocal mesh_screen, mesh_sel, mesh_pick, fleet_sel
         hk, label, cmd, skey, inp = item
         # LoRa Mesh = unified picker (MeshCore/Meshtastic -> region/band -> preset -> chat)
         if cmd == "_lora_mesh":
