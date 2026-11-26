@@ -138,17 +138,34 @@ class SerialLineBuffer:
     and may deliver partial lines.
     """
 
+    # Hard cap on a single un-terminated line. A wrong baud rate or a corrupted
+    # stream with no LF would otherwise let self._buf grow without bound, and each
+    # `self._buf += raw` recopies the whole growing buffer on the game loop thread.
+    # 64 KiB is far above any real ESP32 line (base64 pcap lines are firmware-wrapped).
+    MAX_LINE = 64 * 1024
+
     def __init__(self) -> None:
         self._buf = b""
+        self._discarding = False  # dropping an over-long run until the next LF
 
     def feed(self, raw: bytes) -> List[str]:
         self._buf += raw
         lines: List[str] = []
         while b"\n" in self._buf:
             line, self._buf = self._buf.split(b"\n", 1)
+            if self._discarding:
+                # This segment is the tail of a line we already gave up on —
+                # drop it and resume normal reading after the separator.
+                self._discarding = False
+                continue
             decoded = line.decode("utf-8", errors="replace").strip()
             if decoded:
                 lines.append(decoded)
+        if len(self._buf) > self.MAX_LINE:
+            # No separator in a very long run: abandon it, and keep discarding
+            # bytes until the next LF so we don't emit a mangled partial line.
+            self._buf = b""
+            self._discarding = True
         return lines
 
 

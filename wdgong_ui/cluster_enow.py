@@ -174,6 +174,16 @@ class FleetKey:
     def auth(self, buf: bytes) -> int:
         return wdg_auth_key(buf, self._key) if self._key is not None else wdg_auth_join(buf)
 
+    def verify(self, payload: bytes) -> bool:
+        """True only if a fleet key is loaded AND the frame's tag matches it.
+
+        Fleet frames (CLAIM/TEXT/ADMIN/...) are never accepted on the public join
+        secret: without a key, nothing but JOIN_REQUEST may count as authenticated
+        (see _check_join_auth)."""
+        if self._key is None or len(payload) < 4:
+            return False
+        return _auth_tail(payload) == wdg_auth_key(payload[:-4], self._key)
+
     def raw(self) -> Optional[bytes]:
         """The raw key, e.g. to hand a node a JOIN_GRANT. Handle with care."""
         return self._key
@@ -301,7 +311,7 @@ def decode(payload: bytes, key: FleetKey, src: str = "") -> Optional[Frame]:
         tlen = min(tlen, TEXT_MAX)
         txt = text[:tlen].decode("utf-8", "replace")
         return TextFrame(
-            type=mtype, authed=(_auth_tail(payload) == key.auth(payload[:-4])),
+            type=mtype, authed=key.verify(payload),
             src=src, raw=payload, counter=counter, text=txt,
         )
 
@@ -319,7 +329,7 @@ def decode(payload: bytes, key: FleetKey, src: str = "") -> Optional[Frame]:
         )
 
     # types we recognise but do not decode in v1 (OTA/SENSE/RANGE/VITA/…)
-    return Frame(type=mtype, authed=(_auth_tail(payload) == key.auth(payload[:-4])),
+    return Frame(type=mtype, authed=key.verify(payload),
                  src=src, raw=payload)
 
 
@@ -330,7 +340,7 @@ def _decode_claim(payload: bytes, key: FleetKey, src: str) -> Optional[ClaimFram
     (_, _t, mac, start_idx, end_idx, aver, records, flags,
      hops, recmin, buffered) = _S_CLAIM_PREFIX.unpack(payload[:_S_CLAIM_PREFIX.size])
     cf = ClaimFrame(
-        type=CLAIM, authed=(_auth_tail(payload) == key.auth(payload[:-4])),
+        type=CLAIM, authed=key.verify(payload),
         src=src or mac_to_str(mac), raw=payload,
         mac=mac_to_str(mac), start_idx=start_idx, end_idx=end_idx,
         assignment_version=aver, records=records, flags=flags,
@@ -417,8 +427,11 @@ class BridgeFrame:
 
 
 def parse_bridge_line(line: str) -> Optional[BridgeFrame]:
-    """Parse one 'ENOW,<mac>,<rssi>,<ch>,<hex>' line from the bridge firmware."""
-    line = line.strip()
+    """Parse one 'ENOW,<mac>,<rssi>,<ch>,<hex>' line from the bridge firmware.
+
+    The firmware's console prompt can glue onto the first frame after
+    start_cluster_bridge ('> ENOW,...'), so a leading prompt is stripped."""
+    line = line.strip().lstrip(">").strip()
     if not line.startswith("ENOW,"):
         return None
     parts = line.split(",", 4)
@@ -435,3 +448,237 @@ def parse_bridge_line(line: str) -> Optional[BridgeFrame]:
 def tx_line(mac: str, payload: bytes) -> str:
     """Format a downlink command for the bridge firmware."""
     return f"enow_tx {mac} {payload.hex()}"
+
+
+# --------------------------------------------------------------------------- #
+# Fleet-key share line: WDGFLEET1:<32 hex>:<label>  (same format as Marauder
+# `fleetkey show` / the phone app). One fleet, many cores, ONE core at a time.
+# --------------------------------------------------------------------------- #
+FLEET_LINE_PREFIX = "WDGFLEET1:"
+
+
+def fleet_fingerprint(raw: bytes) -> str:
+    """SHA256 of the RAW 16 key bytes (not of the hex string), first 16 hex."""
+    import hashlib
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
+def fleet_line(raw: bytes, label: str = "") -> str:
+    import re
+    label = re.sub(r"[^A-Za-z0-9 _-]", "", label or "")[:24]
+    return "%s%s:%s" % (FLEET_LINE_PREFIX, raw.hex(), label)
+
+
+def parse_fleet_line(line: str):
+    """-> (raw16, label, "") on success or (None, "", reason)."""
+    import re
+    s = (line or "").strip()
+    if not s.startswith(FLEET_LINE_PREFIX):
+        return None, "", "not a WDGFLEET1 line"
+    body = s[len(FLEET_LINE_PREFIX):]
+    hexpart, _, label = body.partition(":")
+    hexpart = hexpart.strip().lower()
+    if len(hexpart) != 2 * WDG_KEY_LEN or not re.fullmatch(r"[0-9a-f]+", hexpart):
+        return None, "", "key must be 32 hex chars"
+    if label and not re.fullmatch(r"[A-Za-z0-9 _-]{0,24}", label):
+        return None, "", "bad label"
+    return bytes.fromhex(hexpart), label, ""
+
+
+def _fleet_key_write_path() -> str:
+    """Where import writes: the same file FleetKey.load() reads first. An explicit
+    WDGO_FLEET_KEY wins even when that file does not exist yet."""
+    env = os.environ.get("WDGO_FLEET_KEY")
+    if env:
+        return env
+    for p in FleetKey._candidate_paths(None):
+        if os.path.exists(p):
+            return p
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user and hasattr(os, "geteuid") and os.geteuid() == 0:
+        try:
+            import pwd
+            return os.path.join(pwd.getpwnam(sudo_user).pw_dir, ".wdgo", "fleet.key")
+        except (KeyError, ImportError):
+            pass
+    return FleetKey.DEFAULT_PATH
+
+
+def _target_owner():
+    """(uid, gid) the key file should belong to: SUDO_USER when running as root
+    via sudo, else None (keep the caller's own identity)."""
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user and hasattr(os, "geteuid") and os.geteuid() == 0:
+        try:
+            import pwd
+            pw = pwd.getpwnam(sudo_user)
+            return pw.pw_uid, pw.pw_gid
+        except (KeyError, ImportError):
+            return None
+    return None
+
+
+def _open_key_dir(d: str, owner):
+    """Open the key directory WITHOUT following a symlink and return its fd.
+
+    The directory lives in the invoking user's home while this process may run
+    as root, so the user controls the path: every later operation goes through
+    this fd (openat/renameat), never through the path again. Refuses a symlinked
+    directory and a directory owned by anyone but root or the target user."""
+    import stat as _stat
+    if os.path.islink(d):
+        raise OSError("refusing symlinked key directory %s" % d)
+    created = False
+    if not os.path.isdir(d):
+        parent = os.path.dirname(d) or "."
+        os.makedirs(parent, exist_ok=True)
+        try:
+            os.mkdir(d, 0o700)
+            created = True
+        except FileExistsError:
+            pass
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    dfd = os.open(d, flags)
+    try:
+        st = os.fstat(dfd)
+        if not _stat.S_ISDIR(st.st_mode):
+            raise OSError("key path parent is not a directory")
+        allowed = {os.geteuid() if hasattr(os, "geteuid") else st.st_uid, 0}
+        if owner is not None:
+            allowed.add(owner[0])
+        if st.st_uid not in allowed:
+            raise OSError("key directory %s is owned by another user" % d)
+        if created:                            # only touch a directory WE made
+            if owner is not None:
+                os.fchown(dfd, owner[0], owner[1])
+            os.fchmod(dfd, 0o700)
+        return dfd
+    except Exception:
+        os.close(dfd)
+        raise
+
+
+def _read_existing_key(dfd: int, name: str) -> Optional[bytes]:
+    """The current key file's bytes, or None if there is none. Never follows a
+    symlink and never blocks on a FIFO; anything but a regular file is refused."""
+    import stat as _stat
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(name, flags, dir_fd=dfd)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:                     # ELOOP: the key path is a symlink
+        raise OSError("refusing key path (symlink or unreadable): %s" % exc.strerror)
+    try:
+        if not _stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("refusing key path: not a regular file")
+        return os.read(fd, 4096)
+    finally:
+        os.close(fd)
+
+
+def _write_new_file(dfd: int, name: str, data: bytes, owner) -> None:
+    """Create `name` in the directory fd as a NEW 0600 file (O_EXCL + O_NOFOLLOW,
+    so a planted file or symlink makes this fail instead of redirecting it)."""
+    flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL
+             | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+    fd = os.open(name, flags, 0o600, dir_fd=dfd)
+    try:
+        os.fchmod(fd, 0o600)
+        if owner is not None:
+            os.fchown(fd, owner[0], owner[1])
+        view = memoryview(data)
+        while view:
+            n = os.write(fd, view)
+            view = view[n:]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def import_fleet_line(line: str, force: bool = False):
+    """Install the fleet key from a WDGFLEET1 line. -> (ok, message).
+
+    Same rules as Marauder `fleetkey import`: an identical key is a no-op; a
+    DIFFERENT existing key is replaced only with force=True, and the old key is
+    copied aside first (fleet.key.bak-<time>). The caller must refuse while the
+    cluster is running (two brains on one fleet fight over the nodes).
+
+    The game runs as root but writes into the invoking user's home, so the
+    write is symlink-safe: the directory is opened once with O_NOFOLLOW, the
+    backup and the new key are created there as fresh 0600 files (O_EXCL), owned
+    by SUDO_USER, and swapped in with a rename inside that same directory."""
+    import time as _t
+    raw, label, err = parse_fleet_line(line)
+    if raw is None:
+        return False, err
+    path = os.path.abspath(_fleet_key_write_path())
+    d, name = os.path.split(path)
+    owner = _target_owner()
+    try:
+        dfd = _open_key_dir(d, owner)
+    except OSError as exc:
+        return False, "cannot use key directory: %s" % exc
+    try:
+        try:
+            old = _read_existing_key(dfd, name)
+        except OSError as exc:
+            return False, str(exc)
+        new_fp = fleet_fingerprint(raw)
+        if old == raw:
+            return True, "already this fleet key (fp %s)" % new_fp
+        if old and len(old) == WDG_KEY_LEN and not force:
+            return False, "a different key is here (fp %s) - use force" % fleet_fingerprint(old)
+        try:
+            if old:
+                stamp = _t.strftime("%Y%m%d-%H%M%S")
+                for i in range(100):
+                    bak = "%s.bak-%s%s" % (name, stamp, ("-%d" % i) if i else "")
+                    try:
+                        _write_new_file(dfd, bak, old, owner)
+                        break
+                    except FileExistsError:
+                        continue
+                else:
+                    return False, "could not create a backup of the old key"
+            tmp = "%s.tmp-%d-%s" % (name, os.getpid(), os.urandom(4).hex())
+            _write_new_file(dfd, tmp, raw, owner)
+            try:
+                os.rename(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+            except OSError:
+                try:
+                    os.unlink(tmp, dir_fd=dfd)
+                except OSError:
+                    pass
+                raise
+        except OSError as exc:
+            return False, "could not write the fleet key: %s" % exc
+    finally:
+        os.close(dfd)
+    return True, "imported fleet key fp %s%s" % (new_fp, (" from " + label) if label else "")
+
+
+# --------------------------------------------------------------------------- #
+# Log redaction: a JOIN_GRANT carries the raw fleet key, so no bridge line may
+# reach a screen or a log file with its payload intact.
+# --------------------------------------------------------------------------- #
+import re as _re
+
+_TX_RE = _re.compile(r"(enow_tx\s+[0-9A-Fa-f:]{17}\s+)([0-9A-Fa-f]+)")
+_RX_RE = _re.compile(r"(ENOW,[0-9A-Fa-f:]{17},-?\d+,\d+,)([0-9A-Fa-f]+)")
+
+
+def _summary(hexs: str) -> str:
+    t = hexs[8:10] if len(hexs) >= 10 else "??"
+    return "<type %s, %d B>" % (t, len(hexs) // 2)
+
+
+def redact_line(line: str) -> str:
+    """Mask frame payloads in bridge traffic before it is shown or logged: every
+    `enow_tx` payload (echoed by the firmware console too) and every received
+    JOIN_GRANT (type 0x0d). Only the frame type and length are kept."""
+    if not line or ("enow_tx" not in line and "ENOW," not in line):
+        return line
+    line = _TX_RE.sub(lambda m: m.group(1) + _summary(m.group(2)), line)
+    return _RX_RE.sub(lambda m: m.group(1) + (_summary(m.group(2))
+                      if m.group(2)[8:10].lower() == "%02x" % JOIN_GRANT else m.group(2)), line)

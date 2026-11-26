@@ -130,7 +130,8 @@ async def run(args, known):
     alternate = do_scan and do_adv and args.duplex == "alternate"
 
     print("uConsole jako peer WDGWars")
-    print("  sekret     :", secret or "(brak -- tylko sluchanie)")
+    # never print the secret itself (this output goes to a log file)
+    print("  sekret     :", "(ustawiony)" if secret else "(brak -- tylko sluchanie)")
     print("  rozwiazuje :", ", ".join(known) or "nikogo")
     print("  radio      :", adapter,
           "| adv:", "tak" if do_adv else "nie",
@@ -144,11 +145,17 @@ async def run(args, known):
 
     def on_adv(device, adv):
         name = adv.local_name or ""
-        if not name.startswith(prox_ble.PREFIX):
-            return
-        ident = name[len(prox_ble.PREFIX):].upper()
+        if name.startswith(prox_ble.PREFIX):
+            ident = name[len(prox_ble.PREFIX):].upper()
+        else:
+            # Phone path: Android can't set a WDG- Local Name, so the ident rides
+            # in Service Data 0xFFF0 (type byte + 3 raw ident bytes).
+            ident = prox_ble.ident_from_service_data(adv.service_data)
         if not ident:
             return
+        dt = prox_ble.devtype_from_service_data(adv.service_data)
+        if dt:
+            _DEVTYPE[ident] = dt              # hardware kind, shown next to the player
         raw = adv.manufacturer_data.get(company, b"")
         echoes = [bytes(raw[i:i + 2]) for i in range(0, len(raw) - 1, 2)]
         rssi = adv.rssi if adv.rssi is not None else -127
@@ -183,8 +190,7 @@ async def run(args, known):
             slot = prox.slot_of(t)
             if secret:
                 my_ident = prox.derive(secret, slot)
-            echoes = [prox_ble.fingerprint(p.ident)
-                      for p in list(engine.peers.values())[:prox_ble.ECHO_MAX]]
+            echoes = fresh_echoes(engine, t, my_ident)
 
             if alternate:
                 # --- advertise burst (scan must be OFF: add-adv fails during an LE scan) ---
@@ -241,6 +247,53 @@ async def run(args, known):
         print("radio opuszczone")
 
 
+# ident -> device-type char seen in Service Data 0xFFF0 (Z/U/M/B/A/I). Kept here,
+# not in the prox engine, so the engine API stays untouched; bounded below.
+_DEVTYPE = {}
+STRANGER_FRESH_MS = 10_000
+
+
+def fresh_echoes(engine, t, my_ident=""):
+    """Fingerprints of the peers heard in the last STRANGER_FRESH_MS, strongest
+    first, at most ECHO_MAX. This is what an advertisement echoes back so the
+    other side can tell "they hear me" -- never our own fingerprint."""
+    live = [p for p in engine.peers.values()
+            if p.ident and p.ident != my_ident and p.state != prox.LOST
+            and (t - p.last_seen) <= STRANGER_FRESH_MS]
+    live.sort(key=lambda p: -(p.ema if p.ema is not None else -999))
+    out = []
+    for p in live:
+        fp = prox_ble.fingerprint(p.ident)
+        if fp not in out:
+            out.append(fp)
+        if len(out) >= prox_ble.ECHO_MAX:
+            break
+    return out
+
+
+def _atomic_write_json(path, obj):
+    """Write JSON next to `path` via a fresh temp file (O_EXCL, no symlink
+    follow) and rename it into place, so a reader never sees half a file and a
+    planted link in a shared directory is never written through."""
+    import tempfile
+    d = os.path.dirname(os.path.abspath(path)) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".wdgprox-", suffix=".tmp", dir=d)
+    try:
+        os.fchmod(fd, 0o644)
+        with os.fdopen(fd, "w") as f:
+            fd = -1
+            json.dump(obj, f)
+        os.replace(tmp, path)
+    except Exception:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def write_snapshot(path, engine, t, my_ident, slot):
     """Dump the current view as JSON for a separate UI to draw (pyxel etc.).
 
@@ -254,22 +307,45 @@ def write_snapshot(path, engine, t, my_ident, slot):
         if p.label in seen:
             continue
         seen.add(p.label)
+        dt = _DEVTYPE.get(p.ident, "")
         rows.append({"label": p.label,
                      "ema": round(p.ema, 1) if p.ema is not None else None,
                      "state": p.state, "trend": p.trend(),
-                     "mutual": p.mutual(t), "bar": p.bar(20)})
+                     "mutual": p.mutual(t), "bar": p.bar(20),
+                     "dev": dt, "model": prox_ble.DEVTYPE_LABEL.get(dt, "")})
+    # Unresolved peers (strangers): one label format on every device (locosp
+    # 2026-11-25): <Model>-XXXX, or WDG-XXXX without a device type, XXXX = first
+    # 4 hex of the current ident (= the echo fingerprint). Idents rotate every
+    # minute, so only peers heard in the last STRANGER_FRESH_MS are listed: the
+    # old ident of a rotated peer must not linger as a second row.
+    strangers = []
+    for p in engine.peers.values():
+        if p.label or p.state == prox.LOST or (t - p.last_seen) > STRANGER_FRESH_MS:
+            continue
+        dt = _DEVTYPE.get(p.ident, "")
+        model = prox_ble.DEVTYPE_LABEL.get(dt, "")
+        strangers.append({"label": "%s-%s" % (model or "WDG", p.ident[:4].upper()),
+                          "ema": round(p.ema, 1) if p.ema is not None else None,
+                          "state": p.state, "trend": p.trend(),
+                          "mutual": p.mutual(t), "bar": p.bar(20),
+                          "dev": dt, "model": model, "resolved": False})
+    strangers.sort(key=lambda r: -(r["ema"] if r["ema"] is not None else -999))
+    if len(_DEVTYPE) > 256:                    # idents rotate every minute
+        live = set(engine.peers)
+        for k in [k for k in _DEVTYPE if k not in live]:
+            _DEVTYPE.pop(k, None)
     meet = None
     for p in engine.peers.values():
         if p.contact_at is not None and (t - p.contact_at) < 6000:
             meet = {"label": p.label or p.ident,
                     "rssi": round(p.ema, 1) if p.ema is not None else None}
-    snap = {"my_ident": my_ident, "slot": slot, "rows": rows,
+    snap = {"my_ident": my_ident, "slot": slot, "rows": rows, "strangers": strangers,
             "unknown": engine.unknown_count(), "peers": len(engine.peers),
-            "meet": meet, "ts": t}
+            "meet": meet, "ts": t,
+            # heard peers' fingerprints for the separate advertiser (dbus_adv) to echo
+            "echo": [fp.hex() for fp in fresh_echoes(engine, t, my_ident)]}
     try:
-        with open(path + ".tmp", "w") as f:
-            json.dump(snap, f)
-        os.replace(path + ".tmp", path)
+        _atomic_write_json(path, snap)
     except Exception:
         pass
 
@@ -323,8 +399,23 @@ def parse_args():
     ap.add_argument("--snapshot", default="", help="write JSON view here each window (for a UI)")
     ap.add_argument("--scan-only", action="store_true")
     ap.add_argument("--advertise-only", action="store_true")
+    ap.add_argument("--config-stdin", action="store_true", dest="config_stdin",
+                    help='read {"secret": ..., "know": {label: secret}} as JSON from '
+                         "stdin (keeps secrets out of the process arguments)")
     a = ap.parse_args()
     known = {}
+    if a.config_stdin:
+        try:
+            cfg = json.loads(sys.stdin.read() or "{}")
+        except ValueError:
+            ap.error("--config-stdin: stdin is not valid JSON")
+        if not isinstance(cfg, dict):
+            ap.error("--config-stdin: expected a JSON object")
+        if isinstance(cfg.get("secret"), str):
+            a.secret = cfg["secret"]
+        kn = cfg.get("know") or {}
+        if isinstance(kn, dict):
+            known.update({str(k): str(v) for k, v in kn.items()})
     for kv in a.know:
         if "=" not in kv:
             ap.error("--know wants label=secret, got %r" % kv)

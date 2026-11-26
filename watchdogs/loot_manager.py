@@ -22,8 +22,10 @@ import io
 import json
 import logging
 import os
+import tempfile
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
@@ -34,7 +36,18 @@ from . import wigle
 log = logging.getLogger(__name__)
 
 
-def _fsync_file(fh) -> None:
+@dataclass
+class _SidecarFix:
+    """Minimal GpsFix stand-in built from a capture's .gps.json sidecar, so an
+    archive rebuild tags a file with the position recorded WHEN it was captured,
+    never the device's position now."""
+    latitude: float = 0.0
+    longitude: float = 0.0
+    altitude: float = 0.0
+    valid: bool = True
+
+
+def _fsync_file(fh, strict: bool = False) -> None:
     """Flush Python buffer + OS page cache to physical disk.
 
     Without this, `with open(...).write(...)` only pushes bytes down to the
@@ -42,12 +55,17 @@ def _fsync_file(fh) -> None:
     cache back to the eMMC/SD, the data is gone. fsync makes the write
     survive a hard power cut. Costs ~5–20 ms on SD — cheap per event,
     expensive per frame, so call it only from discrete save-on-event paths.
+
+    strict=True re-raises an fsync/flush failure so a durable-write path does NOT
+    proceed to rename/commit data it could not actually persist (a silently
+    swallowed fsync error used to be reported to the caller as success).
     """
     try:
         fh.flush()
         os.fsync(fh.fileno())
     except OSError:
-        pass
+        if strict:
+            raise
 
 
 def _sync_append(path: Path, text: str, encoding: str = "utf-8",
@@ -101,6 +119,17 @@ class LootManager:
         self._wd_lock = threading.Lock()
         self._wd_lines: Optional[List[str]] = None   # full file cache, lazy
         self._wd_index: dict = {}                     # mac -> (line_idx, rssi)
+        self._wd_nopos: set = set()                   # macs whose row has no GPS position yet
+
+        # Serialises MeshCore node CSV read-modify-write (dedup + position upgrade).
+        self._mc_lock = threading.Lock()
+
+        # Guards every mutation of self._db AND its serialisation to disk. The game
+        # loop, the portal thread (badges) and the MeshCore callback all touch the
+        # DB; without one shared lock two writers could interleave a dict mutation
+        # with json.dump (corrupt file) or race on a shared temp file. RLock so a
+        # mutator may hold it across its own _save_db call.
+        self._db_lock = threading.RLock()
 
         # Handshake metadata parser state (from serial log keywords)
         self._hs_buffer: List[str] = []
@@ -266,14 +295,20 @@ class LootManager:
         return db
 
     def _retroactive_22000(self, session_path: Path) -> None:
-        """Generate .22000 for any .hccapx without a matching .22000."""
+        """Generate .22000 for any .hccapx without a matching .22000.
+
+        This runs on rebuild, possibly long after capture, so it must NOT use the
+        live GPS fix (that would stamp an old handshake with today's location).
+        It uses only the capture's own .gps.json sidecar; with no sidecar the
+        .22000 is written without a GPS header (#15)."""
+        from .hc22000 import convert_hccapx_to_22000
         hs_dir = session_path / "handshakes"
         if not hs_dir.is_dir():
             return
         try:
             for f in hs_dir.iterdir():
                 if f.suffix == ".hccapx" and not f.with_suffix(".22000").exists():
-                    self._try_generate_22000(f)
+                    convert_hccapx_to_22000(f, gps_fix=self._sidecar_gps(f))
         except OSError:
             pass
 
@@ -434,23 +469,38 @@ class LootManager:
     def _save_db(self, db: dict) -> None:
         """Write the DB to loot_db.json atomically. fsync'd before rename so
         a power cut between tmp write and rename can't leave a zero-byte
-        loot_db.json (the rename is atomic on the same filesystem)."""
-        try:
-            tmp = self._db_path.with_suffix(".tmp")
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(db, fh, indent=2)
-                _fsync_file(fh)
-            tmp.replace(self._db_path)
-        except OSError as exc:
-            log.error("Cannot save loot DB: %s", exc)
+        loot_db.json (the rename is atomic on the same filesystem).
+
+        Held under _db_lock so the dict can't be mutated by another thread during
+        json.dump, and each write uses its OWN temp file (mkstemp) so two
+        concurrent writers never clobber a shared ``.tmp``."""
+        with self._db_lock:
+            tmpname = None
+            try:
+                fd, tmpname = tempfile.mkstemp(
+                    dir=str(self._db_path.parent), prefix=".loot_db.", suffix=".tmp")
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    json.dump(db, fh, indent=2)
+                    _fsync_file(fh, strict=True)
+                os.replace(tmpname, self._db_path)
+                tmpname = None
+            except OSError as exc:
+                log.error("Cannot save loot DB: %s", exc)
+            finally:
+                if tmpname is not None:
+                    try:
+                        os.unlink(tmpname)
+                    except OSError:
+                        pass
 
     def update_session_loot(self) -> None:
         """Rescan current session and update aggregate DB."""
         if not self._session_active:
             return
-        self._db["sessions"][self._session_key] = self._scan_session_dir(self._session)
-        self._recalc_totals(self._db)
-        self._save_db(self._db)
+        with self._db_lock:
+            self._db["sessions"][self._session_key] = self._scan_session_dir(self._session)
+            self._recalc_totals(self._db)
+            self._save_db(self._db)
 
     @property
     def loot_totals(self) -> dict:
@@ -493,9 +543,10 @@ class LootManager:
 
     def save_xp(self, xp: int) -> None:
         """Persist current XP to loot_db.json."""
-        if self._db.get("xp") != xp:
-            self._db["xp"] = xp
-            self._save_db(self._db)
+        with self._db_lock:
+            if self._db.get("xp") != xp:
+                self._db["xp"] = xp
+                self._save_db(self._db)
 
     # ------------------------------------------------------------------
     # Persistent badges
@@ -507,11 +558,12 @@ class LootManager:
 
     def save_badge(self, badge: str) -> None:
         """Add a badge and persist to loot_db.json."""
-        badges = set(self._db.get("badges", []))
-        if badge not in badges:
-            badges.add(badge)
-            self._db["badges"] = sorted(badges)
-            self._save_db(self._db)
+        with self._db_lock:
+            badges = set(self._db.get("badges", []))
+            if badge not in badges:
+                badges.add(badge)
+                self._db["badges"] = sorted(badges)
+                self._save_db(self._db)
 
     # ------------------------------------------------------------------
     # Persistent MeshCore contacts
@@ -527,32 +579,35 @@ class LootManager:
 
     def save_contact(self, node_id: str, data: dict) -> bool:
         """Save or update a MeshCore contact. Returns True if new contact."""
-        contacts = self._db.setdefault("mc_contacts", {})
-        is_new = node_id not in contacts
-        if is_new:
-            data.setdefault("first_seen", time.time())
-            data.setdefault("note", "")
-        else:
-            # Preserve first_seen and note from existing
-            data["first_seen"] = contacts[node_id].get("first_seen", time.time())
-            data["note"] = contacts[node_id].get("note", "")
-        contacts[node_id] = data
-        self._save_db(self._db)
-        return is_new
+        with self._db_lock:
+            contacts = self._db.setdefault("mc_contacts", {})
+            is_new = node_id not in contacts
+            if is_new:
+                data.setdefault("first_seen", time.time())
+                data.setdefault("note", "")
+            else:
+                # Preserve first_seen and note from existing
+                data["first_seen"] = contacts[node_id].get("first_seen", time.time())
+                data["note"] = contacts[node_id].get("note", "")
+            contacts[node_id] = data
+            self._save_db(self._db)
+            return is_new
 
     def save_contact_note(self, node_id: str, note: str) -> None:
         """Update note for a MeshCore contact."""
-        contacts = self._db.setdefault("mc_contacts", {})
-        if node_id in contacts:
-            contacts[node_id]["note"] = note
-            self._save_db(self._db)
+        with self._db_lock:
+            contacts = self._db.setdefault("mc_contacts", {})
+            if node_id in contacts:
+                contacts[node_id]["note"] = note
+                self._save_db(self._db)
 
     def delete_contact(self, node_id: str) -> None:
         """Remove a MeshCore contact from loot_db."""
-        contacts = self._db.get("mc_contacts", {})
-        if node_id in contacts:
-            del contacts[node_id]
-            self._save_db(self._db)
+        with self._db_lock:
+            contacts = self._db.get("mc_contacts", {})
+            if node_id in contacts:
+                del contacts[node_id]
+                self._save_db(self._db)
 
     def calculate_xp_from_loot(self) -> int:
         """Calculate XP from all historical loot data.
@@ -852,16 +907,31 @@ class LootManager:
     # GPS sidecar (Pwnagotchi-compatible .gps.json)
     # ------------------------------------------------------------------
 
+    def _valid_gps_fix(self):
+        """Current GPS fix ONLY if it is present and fresh, else None. Gates on the
+        manager's staleness-aware has_valid_fix (falls back to available+valid for a
+        manager without it) so a frozen last-known position after GPS loss never
+        geo-tags new loot (#10)."""
+        gps = self._gps
+        if not gps:
+            return None
+        fresh = getattr(gps, "has_valid_fix", None)
+        if fresh is None:
+            # Older manager without staleness ageing
+            if not getattr(gps, "available", False) or not gps.fix.valid:
+                return None
+        elif not fresh:
+            return None
+        return gps.fix
+
     def _save_gps_sidecar(self, base_path: Path) -> None:
         """Write a .gps.json sidecar alongside a capture file.
 
         Creates e.g. MyWiFi_AABB_143022.pcap.gps.json with raw GPS fix.
         Loot always contains full (unmasked) data.
         """
-        if not self._gps or not self._gps.available:
-            return
-        fix = self._gps.fix
-        if not fix.valid:
+        fix = self._valid_gps_fix()
+        if not fix:
             return
         geo_path = base_path.parent / (base_path.name + ".gps.json")
         try:
@@ -881,10 +951,8 @@ class LootManager:
 
     def _gps_header_lines(self) -> str:
         """Return GPS header lines for .txt handshake files, or empty string."""
-        if not self._gps or not self._gps.available:
-            return ""
-        fix = self._gps.fix
-        if not fix.valid:
+        fix = self._valid_gps_fix()
+        if not fix:
             return ""
         return (
             f"# GPS: {fix.latitude:.7f}, {fix.longitude:.7f}\n"
@@ -896,13 +964,29 @@ class LootManager:
     # ------------------------------------------------------------------
 
     def _try_generate_22000(self, hccapx_path: Path) -> None:
-        """Generate a .22000 file from an HCCAPX if the handshake is complete."""
+        """Generate a .22000 file from an HCCAPX captured NOW, tagging it with the
+        current (fresh) GPS fix."""
         from .hc22000 import convert_hccapx_to_22000
 
-        gps_fix = None
-        if self._gps and self._gps.available:
-            gps_fix = self._gps.fix
-        convert_hccapx_to_22000(hccapx_path, gps_fix=gps_fix)
+        convert_hccapx_to_22000(hccapx_path, gps_fix=self._valid_gps_fix())
+
+    def _sidecar_gps(self, capture_path: Path):
+        """GPS fix recorded WITH a capture (its ``<name>.gps.json`` sidecar), or
+        None. Used on archive rebuild so an old file's .22000 header carries the
+        position from when it was captured — never the device's position today."""
+        sidecar = capture_path.parent / (capture_path.name + ".gps.json")
+        if not sidecar.is_file():
+            return None
+        try:
+            d = json.loads(sidecar.read_text(encoding="utf-8"))
+            return _SidecarFix(
+                latitude=float(d["Latitude"]),
+                longitude=float(d["Longitude"]),
+                altitude=float(d.get("Altitude", 0.0)),
+                valid=True,
+            )
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
 
     # ------------------------------------------------------------------
     # Scan results
@@ -930,44 +1014,115 @@ class LootManager:
         return self._AUTH_MAP.get(auth.strip(), f"[{auth}][ESS]")
 
     def _gps_tag(self):
-        """Host GPS fix as (lat, lon, alt, accuracy), zeros if no fix."""
+        """Host GPS fix as (lat, lon, alt, accuracy), zeros if no (fresh) fix."""
         lat = lon = alt = accuracy = 0.0
-        if self._gps and self._gps.available:
-            fix = self._gps.fix
-            if fix.valid:
-                lat = round(fix.latitude, 7)
-                lon = round(fix.longitude, 7)
-                alt = round(fix.altitude, 1)
-                accuracy = round(fix.hdop * 5.0, 1) if fix.hdop < 99 else 0.0
+        fix = self._valid_gps_fix()
+        if fix:
+            lat = round(fix.latitude, 7)
+            lon = round(fix.longitude, 7)
+            alt = round(fix.altitude, 1)
+            accuracy = round(fix.hdop * 5.0, 1) if fix.hdop < 99 else 0.0
         return lat, lon, alt, accuracy
+
+    @staticmethod
+    def _atomic_write_lines(path: Path, lines) -> None:
+        """Replace `path` with `lines` atomically: write a temp file in the same
+        directory, fsync it, rename over the original, fsync the directory. A crash
+        or full disk mid-write leaves the old file intact instead of a truncated one."""
+        tmp = path.with_name(path.name + ".tmp")
+        try:
+            with open(tmp, "w", newline="", encoding="utf-8") as fh:
+                fh.writelines(lines)
+                _fsync_file(fh, strict=True)   # a failed fsync must abort the commit
+            os.replace(tmp, path)
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        try:
+            dfd = os.open(str(path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _row_has_pos(parts) -> bool:
+        """True when a WiGLE row carries a real position: BOTH coordinates present,
+        finite and in range. A row with one empty coordinate (e.g. lat blank, lon
+        20) is NOT positioned — otherwise it would read as 0,20."""
+        try:
+            slat = str(parts[wigle.IDX["CurrentLatitude"]]).strip()
+            slon = str(parts[wigle.IDX["CurrentLongitude"]]).strip()
+        except (IndexError, KeyError):
+            return False
+        if not slat or not slon:
+            return False
+        try:
+            lat = float(slat)
+            lon = float(slon)
+        except ValueError:
+            return False
+        return not (lat == 0.0 and lon == 0.0) and -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0
+
+    @staticmethod
+    def _carry_first_seen(old_line: str, new_row: str) -> str:
+        """Return new_row with its FirstSeen replaced by old_line's, so replacing a
+        row with a stronger sighting keeps the ORIGINAL first-detection time. If the
+        old value is missing/blank, new_row is returned unchanged."""
+        fs = wigle.IDX["FirstSeen"]
+        try:
+            old_parts = next(csv.reader([old_line]))
+            new_parts = next(csv.reader([new_row]))
+        except Exception:
+            return new_row
+        if fs >= len(old_parts) or fs >= len(new_parts):
+            return new_row
+        old_fs = old_parts[fs].strip()
+        if not old_fs:
+            return new_row
+        new_parts[fs] = old_parts[fs]
+        buf = io.StringIO()
+        csv.writer(buf, lineterminator="\n").writerow(new_parts)
+        return buf.getvalue()
 
     def _wd_load_index(self, path: Path, rssi_idx: int) -> None:
         """Seed the in-memory wardrive cache from disk ONCE (handles a pre-existing
         session file on resume). After this, writes never re-read the file. Line
-        indices in self._wd_index match positions in self._wd_lines, headers included."""
+        indices in self._wd_index match positions in self._wd_lines, headers included.
+
+        Raises OSError if the file EXISTS but cannot be read — the caller must then
+        leave the cache uninitialised and retry later, never treat the session as
+        empty (that would overwrite an unreadable-but-present route with just a
+        header + the new row). A genuinely absent file is the normal empty case."""
         lines: List[str] = []
         index: dict = {}
+        nopos: set = set()
         if path.is_file():
-            try:
-                with open(path, "r", encoding="utf-8", newline="") as fh:
-                    for i, line in enumerate(fh):
-                        lines.append(line)
-                        if wigle.is_pre_header(line) or wigle.is_header(line):
-                            continue
-                        try:
-                            parts = next(csv.reader([line]))
-                        except Exception:
-                            continue
-                        if not parts:
-                            continue
-                        try:
-                            index[parts[0]] = (i, int(parts[rssi_idx]))
-                        except (ValueError, IndexError):
-                            index[parts[0]] = (i, -100)
-            except OSError:
-                lines, index = [], {}
+            with open(path, "r", encoding="utf-8", newline="") as fh:
+                for i, line in enumerate(fh):
+                    lines.append(line)
+                    if wigle.is_pre_header(line) or wigle.is_header(line):
+                        continue
+                    try:
+                        parts = next(csv.reader([line]))
+                    except Exception:
+                        continue
+                    if not parts:
+                        continue
+                    try:
+                        index[parts[0]] = (i, int(parts[rssi_idx]))
+                    except (ValueError, IndexError):
+                        index[parts[0]] = (i, -100)
+                    if not self._row_has_pos(parts):
+                        nopos.add(parts[0])
         self._wd_lines = lines
         self._wd_index = index
+        self._wd_nopos = nopos
 
     def _wardrive_upsert(self, key_mac: str, new_row: str, rssi_val: int) -> bool:
         """Dedup wardriving.csv by MAC (column 0): one row per BSSID, the strongest
@@ -981,42 +1136,78 @@ class LootManager:
         Returns True if a row was written."""
         path = self._session / "wardriving.csv"
         rssi_idx = wigle.IDX["RSSI"]
+        try:
+            has_pos = self._row_has_pos(next(csv.reader([new_row])))
+        except Exception:
+            has_pos = False
         with self._wd_lock:
             if self._wd_lines is None:
-                self._wd_load_index(path, rssi_idx)
+                try:
+                    self._wd_load_index(path, rssi_idx)
+                except OSError as exc:
+                    # Existing file unreadable: keep the cache uninitialised and
+                    # retry next sighting rather than overwrite the route (#4).
+                    log.error("wardriving.csv unreadable, keeping route pending: %s", exc)
+                    return False
             prev = self._wd_index.get(key_mac)
             if prev is not None:
                 old_idx, old_rssi = prev
-                if rssi_val <= old_rssi:
-                    return False  # existing observation is stronger or equal
-                self._wd_lines[old_idx] = new_row
-                self._wd_index[key_mac] = (old_idx, rssi_val)
+                old_nopos = key_mac in self._wd_nopos
+                # A row saved without a GPS fix (indoors, cold GPS) takes the first
+                # sighting that has a position, whatever its RSSI; a positioned row is
+                # never traded for one without a position.
+                if not (has_pos and old_nopos):
+                    if rssi_val <= old_rssi:
+                        return False  # existing observation is stronger or equal
+                    if not has_pos and not old_nopos:
+                        return False
+                # Preserve the original FirstSeen when a stronger/positioned sighting
+                # replaces the row — the first detection time must not jump forward
+                # to "now" just because the signal got stronger later (#25).
+                new_row = self._carry_first_seen(self._wd_lines[old_idx], new_row)
+                new_lines = list(self._wd_lines)
+                new_lines[old_idx] = new_row
                 try:
-                    with open(path, "w", newline="", encoding="utf-8") as fh:
-                        fh.writelines(self._wd_lines)
-                        _fsync_file(fh)
+                    self._atomic_write_lines(path, new_lines)
                 except OSError as exc:
                     log.error("Cannot update wardriving CSV: %s", exc)
+                    return False      # disk unchanged -> index unchanged
+                self._wd_lines = new_lines
+                self._wd_index[key_mac] = (old_idx, rssi_val)
+                if has_pos:
+                    self._wd_nopos.discard(key_mac)
                 return True
             # new BSSID — O(1) append, no full rewrite
             fresh = not self._wd_lines
+            try:
+                if fresh:
+                    self._atomic_write_lines(
+                        path, [self._WIGLE_PRE_HEADER, self._WIGLE_HEADER, new_row])
+                else:
+                    try:
+                        size_before = path.stat().st_size
+                    except OSError:
+                        size_before = None
+                    try:
+                        with open(path, "a", newline="", encoding="utf-8") as fh:
+                            fh.write(new_row)
+                            _fsync_file(fh, strict=True)   # fsync fail -> treat as not written
+                    except OSError:
+                        if size_before is not None:     # drop a half-written tail line
+                            try:
+                                os.truncate(path, size_before)
+                            except OSError:
+                                pass
+                        raise
+            except OSError as exc:
+                log.error("Cannot save wardriving row: %s", exc)
+                return False          # not on disk -> not in the index either
             if fresh:
                 self._wd_lines = [self._WIGLE_PRE_HEADER, self._WIGLE_HEADER]
             self._wd_index[key_mac] = (len(self._wd_lines), rssi_val)
             self._wd_lines.append(new_row)
-            try:
-                if fresh:
-                    with open(path, "w", newline="", encoding="utf-8") as fh:
-                        fh.write(self._WIGLE_PRE_HEADER)
-                        fh.write(self._WIGLE_HEADER)
-                        fh.write(new_row)
-                        _fsync_file(fh)
-                else:
-                    with open(path, "a", newline="", encoding="utf-8") as fh:
-                        fh.write(new_row)
-                        _fsync_file(fh)
-            except OSError as exc:
-                log.error("Cannot save wardriving row: %s", exc)
+            if not has_pos:
+                self._wd_nopos.add(key_mac)
             return True
 
     def save_wardriving_network(self, network: Network) -> bool:
@@ -1181,29 +1372,72 @@ class LootManager:
     # MeshCore
     # ------------------------------------------------------------------
 
+    _MC_HEADER = "timestamp,node_id,type,name,lat,lon,rssi,snr\n"
+
+    @staticmethod
+    def _mc_row_has_pos(row: list) -> bool:
+        """True when a meshcore CSV row (node_id at 1, lat at 4, lon at 5) carries a
+        real position: both present and not 0,0."""
+        if len(row) < 6:
+            return False
+        slat, slon = row[4].strip(), row[5].strip()
+        if not slat or not slon:
+            return False
+        try:
+            lat, lon = float(slat), float(slon)
+        except ValueError:
+            return False
+        return not (lat == 0.0 and lon == 0.0)
+
     def save_meshcore_node(self, node_id: str, node_type: str, name: str,
                            lat: float, lon: float, rssi: float, snr: float) -> None:
-        """Append node to meshcore_nodes.csv (dedup by node_id). fsync'd."""
+        """Upsert a node into meshcore_nodes.csv, keyed on the node_id COLUMN (not a
+        substring match, which could collide with a node name). A node first heard
+        without a position and later re-announced WITH one upgrades the stored row,
+        so the located announcement is not lost behind the earlier position-less
+        one (#22). fsync'd."""
         if not self._session_active:
             return
         path = self._session / "meshcore_nodes.csv"
-        try:
-            if path.is_file():
-                existing = path.read_text(encoding="utf-8")
-                if f",{node_id}," in existing:
-                    return  # already known
-            else:
-                with open(path, "w", encoding="utf-8") as fh:
-                    fh.write("timestamp,node_id,type,name,lat,lon,rssi,snr\n")
-                    _fsync_file(fh)
-            ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-            with open(path, "a", encoding="utf-8", newline="") as fh:
-                csv.writer(fh).writerow(
-                    [ts, node_id, node_type, name, lat, lon, rssi, snr])
-                _fsync_file(fh)
-            self.update_session_loot()
-        except OSError:
-            pass
+        ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        new_row = [ts, node_id, node_type, name, lat, lon, rssi, snr]
+        new_has_pos = self._mc_row_has_pos([str(c) for c in new_row])
+        with self._mc_lock:
+            try:
+                rows: list = []
+                have_header = False
+                if path.is_file():
+                    with open(path, "r", encoding="utf-8", newline="") as fh:
+                        reader = csv.reader(fh)
+                        for i, r in enumerate(reader):
+                            if i == 0 and r and r[0].strip().lower() == "timestamp":
+                                have_header = True
+                                continue
+                            if r:
+                                rows.append(r)
+                existing_idx = next(
+                    (i for i, r in enumerate(rows) if len(r) > 1 and r[1] == node_id),
+                    None)
+                if existing_idx is not None:
+                    # Known node: only rewrite to upgrade a position-less row to a
+                    # located one; otherwise leave the file untouched.
+                    if new_has_pos and not self._mc_row_has_pos(rows[existing_idx]):
+                        rows[existing_idx] = [str(c) for c in new_row]
+                        out = io.StringIO()
+                        out.write(self._MC_HEADER)
+                        csv.writer(out, lineterminator="\n").writerows(rows)
+                        self._atomic_write_lines(path, [out.getvalue()])
+                        self.update_session_loot()
+                    return
+                # New node: create-with-header or append one row.
+                if not have_header and not path.is_file():
+                    _sync_write(path, self._MC_HEADER)
+                buf = io.StringIO()
+                csv.writer(buf, lineterminator="\n").writerow(new_row)
+                _sync_append(path, buf.getvalue())
+                self.update_session_loot()
+            except OSError:
+                pass
 
     def save_meshcore_message(self, channel: str, message: str, rssi: float) -> None:
         """Append message to meshcore_messages.log. fsync'd."""
@@ -1232,13 +1466,12 @@ class LootManager:
         if not self._session_active:
             return
         path = self._session / "bt_devices.csv"
-        # Get GPS coords if available
+        # Get GPS coords only from a fresh fix
         lat, lon = 0.0, 0.0
-        if self._gps and self._gps.available:
-            fix = self._gps.fix
-            if fix.valid:
-                lat = round(fix.latitude, 7)
-                lon = round(fix.longitude, 7)
+        fix = self._valid_gps_fix()
+        if fix:
+            lat = round(fix.latitude, 7)
+            lon = round(fix.longitude, 7)
         if path.is_file():
             try:
                 existing = path.read_text(encoding="utf-8")
@@ -1250,10 +1483,12 @@ class LootManager:
             _sync_write(path,
                         "timestamp,mac,rssi,name,airtag,smarttag,lat,lon\n")
         ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-        _sync_append(
-            path,
-            f"{ts},{mac},{rssi},{name},{is_airtag},{is_smarttag},"
-            f"{lat},{lon}\n")
+        # csv.writer so a device name containing a comma stays in ONE field and
+        # cannot shift lat/lon into the wrong columns (#24).
+        buf = io.StringIO()
+        csv.writer(buf, lineterminator="\n").writerow(
+            [ts, mac, rssi, name, is_airtag, is_smarttag, lat, lon])
+        _sync_append(path, buf.getvalue())
         self.update_session_loot()
 
     def save_bt_airtag_event(self, airtags: int, smarttags: int) -> None:
@@ -1317,28 +1552,39 @@ class LootManager:
                 except OSError:
                     pass
 
-            # BT devices CSV (only WiFi + BT on map, no handshake/meshcore)
+            # BT devices CSV (only WiFi + BT on map, no handshake/meshcore).
+            # Layout: timestamp,mac,rssi,name,airtag,smarttag,lat,lon — head (3)
+            # and tail (airtag,smarttag,lat,lon = 4) are fixed; the name sits in
+            # between. Parse by the fixed ends so a legacy unquoted comma in the
+            # name (extra columns) still yields the right lat/lon (#24).
             bt_file = session_dir / "bt_devices.csv"
             if bt_file.is_file():
                 try:
-                    with open(bt_file, "r", encoding="utf-8") as fh:
-                        reader = csv.DictReader(fh)
-                        for row in reader:
+                    with open(bt_file, "r", encoding="utf-8", newline="") as fh:
+                        reader = csv.reader(fh)
+                        for i, row in enumerate(reader):
+                            if i == 0 and row and row[0].strip().lower() == "timestamp":
+                                continue  # header
+                            if len(row) < 8:
+                                continue
                             try:
-                                lat = float(row.get("lat", 0))
-                                lon = float(row.get("lon", 0))
-                                if lat != 0.0 or lon != 0.0:
-                                    points.append({
-                                        "lat": lat, "lon": lon,
-                                        "type": "bt",
-                                        "label": row.get("name", row.get("mac", "?")),
-                                        "bssid": row.get("mac", ""),
-                                        "auth": "[BLE]",
-                                        "rssi": row.get("rssi", ""),
-                                        "channel": "",
-                                    })
+                                lat = float(row[-2])
+                                lon = float(row[-1])
                             except (ValueError, TypeError):
-                                pass
+                                continue
+                            if lat == 0.0 and lon == 0.0:
+                                continue
+                            mac = row[1] if len(row) > 1 else ""
+                            name = ",".join(row[3:-4]) if len(row) > 7 else ""
+                            points.append({
+                                "lat": lat, "lon": lon,
+                                "type": "bt",
+                                "label": name or mac or "?",
+                                "bssid": mac,
+                                "auth": "[BLE]",
+                                "rssi": row[2] if len(row) > 2 else "",
+                                "channel": "",
+                            })
                 except OSError:
                     pass
 

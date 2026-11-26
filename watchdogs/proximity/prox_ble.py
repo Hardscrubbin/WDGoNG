@@ -36,7 +36,8 @@ _ADV_SVC16 = 0x16                         # Service Data, 16-bit UUID
 # parser that reads only the name/echoes (older firmware) ignores it — no wire
 # regression — while updated ones can show the device model.
 WDG_SVC_UUID = b"\xf0\xff"                # 0xFFF0, little-endian
-DEVTYPE_LABEL = {"Z": "WDGoNG Zero", "U": "uConsole", "M": "Marauder", "B": "Badge"}
+DEVTYPE_LABEL = {"Z": "WDGoNG Zero", "U": "uConsole", "M": "Marauder", "B": "Badge",
+                 "A": "Android", "I": "iPhone"}
 
 # How many peer fingerprints we advertise back. Each is two bytes: enough for
 # the other side to recognise itself, small enough to fit beside the name in
@@ -94,6 +95,53 @@ def adv_devtype(payload):
             except Exception:
                 return ""
     return ""
+
+
+# 128-bit form of the 0xFFF0 service UUID, the key BlueZ/bleak use in an
+# AdvertisementData.service_data dict.
+WDG_SVC_UUID128 = "0000fff0-0000-1000-8000-00805f9b34fb"
+
+
+def adv_ident(payload):
+    """Rotating ident carried in Service Data 0xFFF0 as `<type><3 raw ident bytes>`.
+
+    A phone cannot set an arbitrary BLE Local Name (Android takes the adapter's
+    name), so instead of WDG-<ident> it advertises its ident here: the same 3 raw
+    bytes as SHA256(secret|wdgprox|slot)[:3], behind a 1-byte device-type ('A').
+    Returns the 6-hex-UPPER ident, or "" when the block is just the 1-byte
+    device-type tag (Z/U/M/B) or absent. The WDG- name wins when both are present.
+    """
+    for v in _adv_fields(payload, _ADV_SVC16):
+        v = bytes(v)
+        if len(v) >= 6 and v[:2] == WDG_SVC_UUID:    # uuid(2) + type(1) + ident(3)
+            return v[3:6].hex().upper()
+    return ""
+
+
+def ident_from_service_data(sd):
+    """adv_ident for a BlueZ/bleak service_data dict {uuid: value}. The value has
+    NO UUID prefix: it is `<type><3 raw ident bytes>` (>=4 B for a phone ident)."""
+    if not sd:
+        return ""
+    v = sd.get(WDG_SVC_UUID128) or sd.get(WDG_SVC_UUID128.upper())
+    if v is None:
+        return ""
+    v = bytes(v)
+    return v[1:4].hex().upper() if len(v) >= 4 else ""
+
+
+def devtype_from_service_data(sd):
+    """The device-type char ('Z'/'U'/'M'/'B'/'A'/'I') from a BlueZ/bleak
+    service_data dict, or '' when the 0xFFF0 block is absent."""
+    if not sd:
+        return ""
+    v = sd.get(WDG_SVC_UUID128) or sd.get(WDG_SVC_UUID128.upper())
+    if not v:
+        return ""
+    try:
+        return bytes(v)[:1].decode("ascii", "ignore")
+    except Exception:
+        return ""
 
 
 def fingerprint(ident):
@@ -223,9 +271,10 @@ class Radio:
             except Exception:
                 return
             name = adv_name(payload)
-            if not name.startswith(PREFIX):
-                return
-            ident = name[len(PREFIX):].upper()
+            if name.startswith(PREFIX):
+                ident = name[len(PREFIX):].upper()
+            else:
+                ident = adv_ident(payload)      # phone path: ident in Service Data 0xFFF0
             if not ident:
                 return
             # The IRQ must return fast, so nothing is decided here: the page

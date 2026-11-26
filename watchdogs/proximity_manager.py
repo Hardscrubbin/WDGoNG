@@ -27,6 +27,7 @@ import time
 _HERE = os.path.dirname(os.path.abspath(__file__))
 PEER_SCRIPT = os.path.join(_HERE, "proximity", "peer.py")
 SNAPSHOT_PATH = "/tmp/wdgprox_snap.json"
+LOG_PATH = "/tmp/wdgprox_peer.log"
 
 _CFG_DIR = os.path.expanduser("~/.watchdogs")
 SECRET_FILE = os.path.join(_CFG_DIR, "prox_secret")
@@ -104,11 +105,12 @@ class ProximityManager:
         # We no longer advertise from the peer: btmgmt add-adv is unusable on this UART
         # controller (never registers an instance). Advertising runs in a SECOND process
         # via the BlueZ D-Bus API (dbus_adv), which BlueZ can do alongside the scan.
-        args = [sys.executable, PEER_SCRIPT, "--scan-only",
-                "--secret", self._secret(),
+        # Secrets (ours AND the resolution keys of other players) never go into
+        # argv -- /proc/<pid>/cmdline is world-readable. Both children get them as
+        # JSON / one line on a private stdin pipe instead.
+        args = [sys.executable, PEER_SCRIPT, "--scan-only", "--config-stdin",
                 "--snapshot", self.snapshot]
-        for label, secret in self._known().items():
-            args += ["--know", "%s=%s" % (label, secret)]
+        cfg = json.dumps({"secret": self._secret(), "know": self._known()})
         # Sanitize the env: the game runs under `sudo -E` so the child would inherit
         # XDG_RUNTIME_DIR=/run/user/1000 (the login user's) while running as root, which
         # makes dbus/bleak hang on controller setup — the scan never starts and no
@@ -123,23 +125,55 @@ class ProximityManager:
         if "/usr/bin" not in _path:
             env["PATH"] = "/usr/sbin:/usr/bin:/sbin:/bin" + ((":" + _path) if _path else "")
         _repo = os.path.dirname(os.path.dirname(os.path.dirname(PEER_SCRIPT)))
+        # The advertiser echoes the fingerprints the scanner hears (snapshot "echo").
         adv_args = [sys.executable, "-m", "watchdogs.proximity.dbus_adv",
-                    "--secret", self._secret()]
+                    "--secret-stdin", "--echo-file", self.snapshot]
         _log = None
         try:
-            _log = open("/tmp/wdgprox_peer.log", "a")
+            _log = self._open_log()
             self.proc = subprocess.Popen(
-                args, stdin=subprocess.DEVNULL, stdout=_log, stderr=_log,
+                args, stdin=subprocess.PIPE, stdout=_log, stderr=_log,
                 close_fds=True, env=env)
+            self._feed(self.proc, cfg + "\n")
             self._adv_proc = subprocess.Popen(
-                adv_args, stdin=subprocess.DEVNULL, stdout=_log, stderr=_log,
+                adv_args, stdin=subprocess.PIPE, stdout=_log, stderr=_log,
                 close_fds=True, env=env, cwd=_repo)
+            self._feed(self._adv_proc, self._secret() + "\n")
         except Exception:
-            self.proc = None
+            # A partial start must not orphan the child that did start: end (and
+            # reap) whatever is running before dropping the handles.
+            self._kill()
         finally:
             if _log is not None:
                 try: _log.close()    # children kept their own dup; don't leak the parent's fd
                 except Exception: pass
+
+    def _open_log(self):
+        """The shared child log, opened without following a symlink and kept 0600.
+        Truncated on the first spawn of a game run so output of older builds
+        (which printed the secret) does not linger."""
+        flags = (os.O_WRONLY | os.O_CREAT | os.O_APPEND
+                 | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+        if not getattr(self, "_log_reset", False):
+            flags |= os.O_TRUNC
+        fd = os.open(LOG_PATH, flags, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+        except OSError:
+            pass
+        self._log_reset = True
+        return os.fdopen(fd, "a")
+
+    @staticmethod
+    def _feed(p, text):
+        """Hand a child its config on stdin, then close the pipe."""
+        try:
+            p.stdin.write(text.encode("utf-8"))
+        finally:
+            try:
+                p.stdin.close()
+            except Exception:
+                pass
 
     @staticmethod
     def _end(p):
@@ -150,6 +184,7 @@ class ProximityManager:
                     p.wait(timeout=2)
                 except Exception:
                     p.kill()
+                    p.wait(timeout=2)        # reap it: no zombie, hci0 really free
             except Exception:
                 pass
 
@@ -232,6 +267,10 @@ class ProximityManager:
 
     def meeting(self):
         return self._snap.get("meet") if self.fresh() else None
+
+    def strangers(self):
+        """Unresolved peers as display rows (<Model>-XXXX), strongest first."""
+        return self._snap.get("strangers", []) if self.fresh() else []
 
     def unknown(self):
         return self._snap.get("unknown", 0) if self.fresh() else 0

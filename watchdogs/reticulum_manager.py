@@ -58,6 +58,7 @@ RELAY_HASH = bytes.fromhex("ddcd11421ae8b01d4fc58368c3038208")
 # hash for the WDGWars creds: 0263685665b9d84fad33ac3bc8d110c4
 GROUP_APP = "wdgwars"
 GROUP_ASPECT = "general"
+RX_PART_TTL_S = 300.0  # an open (k/n) set older than this is abandoned
 GROUP_MAX = 150       # keep to one packet (opportunistic ≤~159B); longer → relay only
 
 TCP_HOST = "rns.wdgwars.pl"
@@ -495,34 +496,60 @@ class ReticulumManager:
 
     def _reassemble(self, src: bytes, title: str, k: int, n: int,
                     body: str) -> None:
-        """Reassemble (k/n) chunks by (source, n) with scan-back — tolerates
-        interleaving of two multipart messages from the same sender."""
+        """Reassemble (k/n) chunks by (source, n) with scan-back.
+
+        The relay's chunk format carries no message id, so two multipart messages
+        from the same sender that interleave (A1, B1, A2, B2) cannot be told
+        apart. Instead of silently splicing them, a set that ever had a rival
+        open at the same time is flagged ambiguous, a set that missed its first
+        part is flagged partial, and both are shown marked "[incomplete]".
+        Open sets also expire (RX_PART_TTL_S) so a lost tail is not completed
+        by an unrelated later message."""
         sid = src.hex()[:16]
         nick = title or (sid[:8] if sid else "????")
+        now = time.monotonic()
+        self._rx_parts = [p for p in self._rx_parts
+                          if p["next"] and now - p["t"] <= RX_PART_TTL_S]
+        rivals = [p for p in self._rx_parts if p["sid"] == sid and p["n"] == n]
         if k == 1:
-            self._rx_parts.append({"sid": sid, "nick": nick, "n": n,
-                                   "next": 2, "text": body})
+            entry = {"sid": sid, "nick": nick, "n": n, "next": 2, "text": body,
+                     "t": now, "flag": ""}
+            if rivals:                          # two sets open at once -> ambiguous
+                entry["flag"] = "ambiguous"
+                for p in rivals:
+                    p["flag"] = "ambiguous"
+            self._rx_parts.append(entry)
         else:
-            for p in reversed(self._rx_parts[-8:]):
-                if p["sid"] == sid and p["n"] == n and p["next"] == k:
-                    p["text"] += body
-                    p["next"] = k + 1 if k < n else 0
-                    if p["next"] == 0:
-                        # Cross-path dedup: a short message the relay chunked can
-                        # also arrive whole on the direct GROUP mesh. Same 'chan|'
-                        # key as _handle_group/_handle_inbound → show once.
-                        ckey = "chan|" + p["text"]
-                        if ckey not in self._rx_seen:
-                            self._rx_seen.append(ckey)
-                            if len(self._rx_seen) > 32:
-                                self._rx_seen = self._rx_seen[-32:]
-                            if self._on_message:
-                                self._on_message(p["nick"], p["text"])
-                    break
+            cands = [p for p in rivals if p["next"] == k]
+            if cands:
+                p = cands[-1]
+                if len(cands) > 1:
+                    for c in cands:
+                        c["flag"] = c["flag"] or "ambiguous"
+                p["text"] += body
+                p["t"] = now
+                p["next"] = k + 1 if k < n else 0
+                if p["next"] == 0:
+                    text = p["text"]
+                    if p["flag"]:
+                        text = "[incomplete] " + text
+                    # Cross-path dedup: a short message the relay chunked can
+                    # also arrive whole on the direct GROUP mesh. Same 'chan|'
+                    # key as _handle_group/_handle_inbound → show once.
+                    ckey = "chan|" + p["text"]
+                    if ckey not in self._rx_seen:
+                        self._rx_seen.append(ckey)
+                        if len(self._rx_seen) > 32:
+                            self._rx_seen = self._rx_seen[-32:]
+                        if self._on_message:
+                            self._on_message(p["nick"], text)
+                    self._rx_parts.remove(p)
             else:
-                # Lost part 1 — best-effort partial.
-                self._rx_parts.append({"sid": sid, "nick": nick, "n": n,
-                                       "next": k + 1, "text": body})
+                # Lost part 1 (or out of order) — keep as a flagged partial.
+                if k < n:
+                    self._rx_parts.append({"sid": sid, "nick": nick, "n": n,
+                                           "next": k + 1, "text": body, "t": now,
+                                           "flag": "partial"})
         if len(self._rx_parts) > 12:
             self._rx_parts = [p for p in self._rx_parts[-12:]]
 

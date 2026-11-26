@@ -96,9 +96,7 @@ class FlipperManager:
 
     def close(self) -> None:
         """Disconnect from Flipper."""
-        self._rx_running = False
-        if self._rx_thread and self._rx_thread.is_alive():
-            self._rx_thread.join(timeout=2)
+        self._join_rx()
         if self._ser:
             try:
                 self._ser.close()
@@ -166,36 +164,70 @@ class FlipperManager:
                 pass
 
     def start_rx(self, on_line: Callable[[str], None]) -> None:
-        """Start background thread reading lines from Flipper."""
+        """Start background thread reading lines from Flipper.
+
+        Idempotent: while a reader is alive only the callback is swapped, so
+        repeated RX sessions never stack competing readers on one port."""
         self._on_line = on_line
+        t = self._rx_thread
+        if t is not None and t.is_alive():
+            self._rx_running = True
+            return
         self._rx_running = True
         self._rx_thread = threading.Thread(target=self._rx_loop, daemon=True)
         self._rx_thread.start()
 
     def stop_rx(self) -> None:
-        """Stop background reading."""
-        self._rx_running = False
+        """Stop background reading and wait for the reader to exit, so the port
+        is back to synchronous send() use only."""
         # Send enter to break any blocking read
         if self._ser:
             try:
-                self._ser.write(b"\r\n")
+                with self._lock:
+                    self._ser.write(b"\r\n")
             except Exception:
                 pass
+        self._join_rx()
+
+    def _join_rx(self) -> None:
+        self._rx_running = False
+        t = self._rx_thread
+        if t is not None and t is not threading.current_thread() and t.is_alive():
+            t.join(timeout=3)
+        if t is None or not t.is_alive():
+            self._rx_thread = None
 
     def _rx_loop(self) -> None:
-        """Background thread: read lines and call on_line callback."""
+        """Background thread: read lines and call on_line callback.
+
+        Each read holds the port lock, so a synchronous send() (which also
+        takes it) gets its reply to itself instead of losing it to this thread."""
         while self._rx_running and self._ser:
+            if not self._lock.acquire(timeout=0.2):
+                continue
+            clean = ""
             try:
-                if self._ser.in_waiting:
-                    raw = self._ser.readline().decode(errors="replace").strip()
+                ser = self._ser
+                if ser is not None and ser.in_waiting:
+                    raw = ser.readline().decode(errors="replace").strip()
                     clean = strip_ansi(raw)
-                    if clean and self._on_line:
-                        self._on_line(clean)
-                else:
-                    time.sleep(0.05)
             except Exception:
+                clean = None
+            finally:
+                self._lock.release()
+            if clean is None:
                 if self._rx_running:
                     time.sleep(0.1)
+                continue
+            if clean:
+                cb = self._on_line
+                if cb:
+                    try:
+                        cb(clean)
+                    except Exception:
+                        pass
+            else:
+                time.sleep(0.05)
 
     def _query_device_info(self) -> None:
         """Get device name, firmware, region."""
@@ -233,13 +265,16 @@ class FlipperManager:
         self.send_async(f"subghz tx_from_file {path} {repeat} {device}")
 
     def subghz_stop(self) -> None:
-        """Stop SubGHz by sending enter."""
+        """Stop SubGHz by sending enter, then end the RX reader it was using."""
         self._subghz_active = False
         if self._ser:
             try:
-                self._ser.write(b"\r\n")
+                with self._lock:
+                    self._ser.write(b"\r\n")
             except Exception:
                 pass
+        time.sleep(0.3)                 # let the reader pick up the final lines
+        self._join_rx()
 
     # ------------------------------------------------------------------
     # Storage

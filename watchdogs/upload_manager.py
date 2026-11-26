@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import threading
 from pathlib import Path
 
 from .config import (WPASEC_URL, WPASEC_DL_URL, WPASEC_KEY,
@@ -12,6 +13,40 @@ log = logging.getLogger(__name__)
 
 # Runtime token cache (set from secrets.conf OR via in-game input dialog)
 _runtime_key: str = ""
+
+# Only one WiGLE sync may run at a time: a manual upload racing the cluster's
+# automatic sync could otherwise read the same pending sessions and upload each
+# twice, burning the free-tier daily cap (#14).
+_wigle_sync_lock = threading.Lock()
+
+
+def _write_private(path: Path, text: str, private_dir: bool = False) -> None:
+    """Write text to a 0600 file (fsync'd), tightening a pre-existing looser mode.
+
+    Files holding secrets (API keys) or cracked passwords must never be
+    world/group-readable. Creating with mode 0600 means the file is private from
+    the instant it exists (umask can only clear bits it already lacks), and the
+    explicit chmod repairs any file that already existed as 0644. With
+    private_dir=True the parent dir is also tightened to 0700 — use it only for a
+    dedicated secrets dir (e.g. loot/passwords), never a shared one like repo root.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if private_dir:
+        try:
+            os.chmod(path.parent, 0o700)
+        except OSError:
+            pass
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+    finally:
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
 
 
 def _env(name: str, default: str) -> str:
@@ -59,7 +94,8 @@ def save_wpasec_key(app_dir: str, key: str) -> None:
         if not lines:
             lines.append("# Watch Dogs Go secrets (gitignored)")
         lines.append(f"WDG_WPASEC_KEY={key}")
-    conf.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    # 0600: secrets.conf holds the WPA-sec key; do NOT tighten the repo-root dir.
+    _write_private(conf, "\n".join(lines) + "\n", private_dir=False)
     set_wpasec_key(key)
 
 
@@ -142,13 +178,17 @@ def upload_wpasec_all(loot_dir: Path, blocked_macs: set[str] | None = None,
     if not pcaps:
         return 0, 0, "No capture files found"
 
-    # Filter out whitelisted BSSIDs
+    # Filter out whitelisted BSSIDs. When a whitelist is active, also hold back any
+    # capture whose BSSID can't be read from its filename: an indeterminate-origin
+    # file could belong to a whitelisted device, so it must not be sent to the
+    # external service while the user is deliberately excluding MACs (#1).
     skipped = 0
     if blocked_macs:
+        blocked = {m.strip().upper() for m in blocked_macs if m and m.strip()}
         filtered = []
         for p in pcaps:
             bssid = _bssid_from_filename(p.name)
-            if bssid and bssid in blocked_macs:
+            if not bssid or bssid in blocked:
                 skipped += 1
             else:
                 filtered.append(p)
@@ -199,15 +239,20 @@ def download_wpasec_potfile(loot_dir: Path) -> tuple[bool, int, str]:
         body = resp.text.strip()
         if not body:
             return True, 0, "No cracked passwords yet"
-        lines = [ln for ln in body.splitlines() if ln.strip()]
-        pwd_dir = loot_dir / "passwords"
-        pwd_dir.mkdir(parents=True, exist_ok=True)
-        out = pwd_dir / "wpasec_cracked.potfile"
-        out.write_text(body + "\n", encoding="utf-8")
-        # Parse and save JSON cache
-        parsed = parse_potfile(out)
+        # An error / login / proxy page is HTML, not a potfile. Never let it
+        # overwrite the last good potfile (which would wipe the cracked index and
+        # claim "N passwords saved" for N HTML lines) (#12).
+        if body.lstrip()[:1] == "<":
+            return False, 0, "WPA-sec returned an HTML page, not a potfile (check key)"
+        # Parse first (into memory) so a corrupt download can't clobber good loot.
+        parsed = _parse_potfile_text(body)
+        if parsed["count"] == 0:
+            return False, 0, "no recognizable cracked entries in response - kept previous potfile"
+        out = loot_dir / "passwords" / "wpasec_cracked.potfile"
+        # 0600, private dir: potfile + JSON contain cracked passwords.
+        _write_private(out, body + "\n", private_dir=True)
         _save_potfile_json(loot_dir, parsed)
-        return True, len(lines), f"{len(lines)} passwords saved"
+        return True, parsed["count"], f"{parsed['count']} passwords saved"
     except Exception as exc:
         log.error("WPA-sec download error: %s", exc)
         return False, 0, str(exc)
@@ -224,13 +269,20 @@ def parse_potfile(potfile_path: Path) -> dict:
     Returns {"by_ssid": {"SSID": [{"ap_mac", "client_mac", "password"}]},
              "count": N}
     """
-    result: dict = {"by_ssid": {}, "count": 0}
     if not potfile_path.is_file():
-        return result
+        return {"by_ssid": {}, "count": 0}
     try:
         text = potfile_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
-        return result
+        return {"by_ssid": {}, "count": 0}
+    return _parse_potfile_text(text)
+
+
+def _parse_potfile_text(text: str) -> dict:
+    """Parse potfile CONTENT (shared by the file and the live-download paths).
+    Returns {"by_ssid": {...}, "count": N}; count is the number of RECOGNISED
+    records, which the caller uses to reject an unparseable (e.g. HTML) body."""
+    result: dict = {"by_ssid": {}, "count": 0}
     for line in text.splitlines():
         line = line.strip()
         if not line:
@@ -259,12 +311,10 @@ def parse_potfile(potfile_path: Path) -> dict:
 
 
 def _save_potfile_json(loot_dir: Path, data: dict) -> None:
-    """Save parsed potfile data as JSON cache."""
-    pwd_dir = loot_dir / "passwords"
-    pwd_dir.mkdir(parents=True, exist_ok=True)
-    out = pwd_dir / "wpasec_cracked.json"
+    """Save parsed potfile data as JSON cache (0600 — holds cracked passwords)."""
+    out = loot_dir / "passwords" / "wpasec_cracked.json"
     try:
-        out.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        _write_private(out, json.dumps(data, ensure_ascii=False), private_dir=True)
     except OSError:
         pass
 
@@ -335,9 +385,61 @@ def _wigle_mark(app_dir, name: str) -> None:
     try:
         up = _wigle_uploaded(app_dir)
         up.add(name)
-        _wigle_state_path(app_dir).write_text(json.dumps({"uploaded": sorted(up)}))
+        # Atomic replace so a crash mid-write can't lose the whole upload history
+        # (and truncate it to nothing) (#14).
+        p = _wigle_state_path(app_dir)
+        tmp = p.with_name(p.name + ".tmp")
+        tmp.write_text(json.dumps({"uploaded": sorted(up)}))
+        os.replace(tmp, p)
     except Exception:
         pass
+
+
+def positioned_wigle_csv(path):
+    """A WiGLE 1.6 CSV reduced to the rows that carry a GPS position (both header
+    lines kept). Rows saved without a fix (empty or 0,0), or with only one
+    coordinate, are dropped so they are never uploaded. -> (bytes, kept, dropped).
+
+    The whole file is read through ONE csv.reader and re-emitted through a
+    csv.writer, so an SSID containing a comma or an embedded newline stays a single
+    logical record instead of being split into a truncated row (#20, #21). Never
+    raises on bad rows."""
+    import csv as _csv
+    import io as _io
+    out = _io.StringIO()
+    writer = _csv.writer(out, lineterminator="\n")
+    kept = dropped = 0
+    lat_i, lon_i = 7, 8
+    with open(path, "r", newline="", encoding="utf-8", errors="replace") as fh:
+        for row in _csv.reader(fh):
+            if not row:
+                continue
+            if row[0].startswith("WigleWifi"):
+                writer.writerow(row)
+                continue
+            if row[0] == "MAC":
+                if "CurrentLatitude" in row:
+                    lat_i = row.index("CurrentLatitude")
+                if "CurrentLongitude" in row:
+                    lon_i = row.index("CurrentLongitude")
+                writer.writerow(row)
+                continue
+            slat = row[lat_i].strip() if lat_i < len(row) else ""
+            slon = row[lon_i].strip() if lon_i < len(row) else ""
+            ok = False
+            if slat and slon:          # require BOTH coordinates (keep explicit 0)
+                try:
+                    lat, lon = float(slat), float(slon)
+                    ok = (not (lat == 0.0 and lon == 0.0)
+                          and -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0)
+                except ValueError:
+                    ok = False
+            if ok:
+                writer.writerow(row)
+                kept += 1
+            else:
+                dropped += 1
+    return out.getvalue().encode("utf-8"), kept, dropped
 
 
 def upload_wigle(csv_path: Path, donate: bool = False) -> tuple[bool, str]:
@@ -354,36 +456,63 @@ def upload_wigle(csv_path: Path, donate: bool = False) -> tuple[bool, str]:
     except ImportError:
         return False, "requests library not installed"
     try:
-        with open(csv_path, "rb") as fh:
-            resp = requests.post(
-                WIGLE_API_URL,
-                auth=HTTPBasicAuth(name, token),
-                headers={"Accept": "application/json"},
-                files={"file": (csv_path.name, fh, "text/csv")},
-                data={"donate": "on" if donate else "off"},
-                timeout=120,
-            )
+        body, kept, dropped = positioned_wigle_csv(csv_path)
+    except OSError as exc:
+        return False, "cannot read %s: %s" % (csv_path.name, exc)
+    if not kept:
+        return False, "no rows with a GPS position yet (%d without)" % dropped
+    try:
+        resp = requests.post(
+            WIGLE_API_URL,
+            auth=HTTPBasicAuth(name, token),
+            headers={"Accept": "application/json"},
+            files={"file": (csv_path.name, body, "text/csv")},
+            data={"donate": "on" if donate else "off"},
+            timeout=120,
+        )
     except Exception as exc:
         return False, "network error: %s" % exc
     if resp.status_code == 401:
         return False, "WiGLE auth failed (401) - check API Name/Token"
     if resp.status_code == 429:
         return False, "WiGLE rate limit (429) - try later (free tier daily cap)"
+    # Success requires a real JSON object with an explicit success flag. A 200
+    # carrying a login/proxy HTML page (JSON decode fails) or a JSON list (no
+    # .get) must NOT be treated as an accepted upload, or the session gets marked
+    # uploaded and its data is lost (#8).
     try:
         j = resp.json()
     except Exception:
-        return (resp.status_code == 200,
-                "HTTP %d" % resp.status_code)
+        return False, "unexpected non-JSON response (HTTP %d)" % resp.status_code
+    if not isinstance(j, dict):
+        return False, "unexpected response shape (HTTP %d)" % resp.status_code
+    if resp.status_code != 200:
+        return False, str(j.get("message") or j.get("error") or ("HTTP %d" % resp.status_code))
     if j.get("success"):
         tid = j.get("transid") or j.get("fileName") or ""
         return True, ("accepted%s" % ((" " + str(tid)) if tid else ""))
     return False, str(j.get("message") or j.get("error") or ("HTTP %d" % resp.status_code))
 
 
-def upload_wigle_all(loot_dir: Path, app_dir, donate: bool = False) -> tuple[int, int, str]:
+def upload_wigle_all(loot_dir: Path, app_dir, donate: bool = False,
+                     keep_pending: str = "") -> tuple[int, int, str]:
     """Upload every session's wardriving.csv that has data and hasn't been sent
     yet (tracked in .wigle_sync_state.json). Returns (uploaded, total, summary).
-    Serial, polite to the free-tier daily cap — stops early on a rate limit."""
+    Serial, polite to the free-tier daily cap — stops early on a rate limit.
+
+    A module-level lock makes two concurrent callers (manual upload + automatic
+    cluster sync) mutually exclusive, so they can't both grab the same pending
+    sessions and upload each twice (#14)."""
+    if not _wigle_sync_lock.acquire(blocking=False):
+        return 0, 0, "a WiGLE upload is already running"
+    try:
+        return _upload_wigle_all_locked(loot_dir, app_dir, donate, keep_pending)
+    finally:
+        _wigle_sync_lock.release()
+
+
+def _upload_wigle_all_locked(loot_dir: Path, app_dir, donate: bool,
+                             keep_pending: str) -> tuple[int, int, str]:
     base = Path(loot_dir)
     if not base.is_dir():
         return 0, 0, "no loot directory"
@@ -412,7 +541,8 @@ def upload_wigle_all(loot_dir: Path, app_dir, donate: bool = False) -> tuple[int
         last = msg
         if ok:
             uploaded += 1
-            _wigle_mark(app_dir, d.name)
+            if d.name != keep_pending:          # the active session keeps growing:
+                _wigle_mark(app_dir, d.name)    # re-offer it next time
         elif "rate limit" in msg.lower():
             return uploaded, len(pending), "rate limit hit - %d/%d sent, rest later" % (uploaded, len(pending))
         elif "not configured" in msg.lower():

@@ -8,6 +8,8 @@ reaches the same loot path, dedup and GPS stamping as the ESP32. Runs as root.
 Scan uses `iw dev <iface> scan` in managed mode (no monitor needed, non-intrusive).
 Handshake and deauth need monitor mode (airodump-ng / aireplay-ng).
 """
+import csv
+import io
 import os
 import re
 import shutil
@@ -34,6 +36,26 @@ def _freq_to_channel(mhz: int) -> int:
     if 5955 <= mhz <= 7115:                      # 6 GHz
         return (mhz - 5950) // 5
     return 0
+
+
+def wigle_row(net: dict, first_seen: str) -> str:
+    """One WiGLE row for a parsed scan entry, with the MEASURED frequency.
+
+    wigle.row16() derives the Frequency column from the channel number, which is
+    ambiguous across bands (6 GHz channel 1 = 5955 MHz, not 2412). When iw gave
+    us the frequency, that value goes in; the channel-derived one is only the
+    fallback when the frequency is unknown."""
+    row = wigle.row16(net["bssid"], net["ssid"], net["auth"], first_seen,
+                      net["channel"], net["rssi"], "", "", "", "", rtype="WIFI")
+    freq = int(net.get("freq") or 0)
+    if freq <= 0:
+        return row
+    cols = next(csv.reader(io.StringIO(row)))
+    if len(cols) > 5:
+        cols[5] = str(freq)
+    buf = io.StringIO()
+    csv.writer(buf, lineterminator="\n").writerow(cols)
+    return buf.getvalue()
 
 
 def parse_iw_scan(text: str) -> list:
@@ -133,8 +155,7 @@ class HostWifi:
         now = str(int(time.time()))
         n = 0
         for net in parse_iw_scan(r.stdout):
-            row = wigle.row16(net["bssid"], net["ssid"], net["auth"], now,
-                              net["channel"], net["rssi"], "", "", "", "", rtype="WIFI")
+            row = wigle_row(net, now)
             self._on_row(row.rstrip("\n"), False)
             n += 1
         return n

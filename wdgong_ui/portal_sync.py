@@ -28,6 +28,7 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import platform as _plat
 import secrets as _secrets
 import threading
@@ -35,13 +36,38 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
+from urllib.request import Request, build_opener, HTTPRedirectHandler
 
 from watchdogs import wigle
 
 log = logging.getLogger(__name__)
 
 DEFAULT_API_URL = "https://wdgwars.pl/api/upload/"
+
+
+class _SameOriginRedirect(HTTPRedirectHandler):
+    """Follow a redirect ONLY if it stays on the same https scheme+host+port.
+
+    Every authenticated request carries ``X-API-Key``; urllib replays custom
+    headers across redirects, so a redirect to another host (or an http
+    downgrade) would hand the portal key to a different server. Any cross-origin
+    or non-https redirect is refused here instead of followed (#2)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        old, new = urlsplit(req.full_url), urlsplit(newurl)
+        if new.scheme != "https" or (new.scheme, new.hostname, new.port) != (
+                old.scheme, old.hostname, old.port):
+            raise HTTPError(
+                req.full_url, code,
+                "refused cross-origin/insecure redirect to %s (API key not forwarded)"
+                % (new.hostname or "?"), headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+# Shared opener: all authenticated calls go through _open(), which uses this, so
+# none of them can be redirected off-origin with the key attached.
+_SECURE_OPENER = build_opener(_SameOriginRedirect())
 
 # User-Agent: the portal parses product + version with ^WatchDogsGo(-NG)?/([0-9]...)
 # and routes uConsole traffic into its own ranking. Keep the product token stable
@@ -321,7 +347,9 @@ class PortalSync:
     def _open(self, req: Request, timeout: float = 30):
         req.add_header("User-Agent", self._ua)
         req.add_header("Accept", "application/json")
-        return urlopen(req, timeout=timeout)
+        # Use the same-origin opener so a redirect can never forward X-API-Key
+        # to another host (#2).
+        return _SECURE_OPENER.open(req, timeout=timeout)
 
     # ------------------------------------------------------------------
     # session discovery
@@ -359,36 +387,49 @@ class PortalSync:
         if not csv_path.is_file():
             return []
         rows = wigle.parse_file(csv_path)
-        if not rows:
-            return []
-        out = []
+        if rows is None:
+            # Whole-file read error — propagate so the session stays PENDING
+            # instead of being closed as "no GPS data" on a truncated parse (#9).
+            raise OSError(f"cannot read {csv_path.name}")
+        out, bad = [], 0
         for parts, cmap in rows:
             g = lambda name, d="": wigle.get(parts, cmap, name, d)
             try:
-                lat = float(g("CurrentLatitude") or 0.0)
-                lon = float(g("CurrentLongitude") or 0.0)
-            except ValueError:
+                # Require BOTH coordinates, non-empty and finite, before bounds —
+                # an empty lat with lon=20 must not become (0, 20) (#20).
+                slat, slon = g("CurrentLatitude").strip(), g("CurrentLongitude").strip()
+                if not slat or not slon:
+                    continue
+                lat, lon = float(slat), float(slon)
+                if lat != lat or lon != lon or abs(lat) == float("inf") or abs(lon) == float("inf"):
+                    continue
+                if not _in_bounds(lat, lon):
+                    continue
+                ch = g("Channel")
+                rssi = g("RSSI")
+                try:
+                    alt = float(g("AltitudeMeters") or 0.0)
+                    if alt != alt or abs(alt) == float("inf"):
+                        alt = 0.0
+                except ValueError:
+                    alt = 0.0
+                out.append({
+                    "bssid": g("MAC"),
+                    "ssid": g("SSID"),
+                    "auth": _map_auth(g("AuthMode")),
+                    "first_seen": g("FirstSeen"),
+                    "channel": int(ch) if ch.strip().isdigit() else 0,
+                    "rssi": int(rssi) if rssi.strip().lstrip("-").isdigit() else -100,
+                    "lat": lat,
+                    "lon": lon,
+                    "alt": alt,
+                    "type": g("Type", "WIFI") or "WIFI",
+                })
+            except Exception:
+                bad += 1  # isolate a bad record, keep the rest (#9)
                 continue
-            if not _in_bounds(lat, lon):
-                continue
-            ch = g("Channel")
-            rssi = g("RSSI")
-            try:
-                alt = float(g("AltitudeMeters") or 0.0)
-            except ValueError:
-                alt = 0.0
-            out.append({
-                "bssid": g("MAC"),
-                "ssid": g("SSID"),
-                "auth": _map_auth(g("AuthMode")),
-                "first_seen": g("FirstSeen"),
-                "channel": int(ch) if ch.strip().isdigit() else 0,
-                "rssi": int(rssi) if rssi.strip().lstrip("-").isdigit() else -100,
-                "lat": lat,
-                "lon": lon,
-                "alt": alt,
-                "type": g("Type", "WIFI") or "WIFI",
-            })
+        if bad:
+            self._log(f"  {csv_path.name}: skipped {bad} malformed network row(s)", "warn")
         return out
 
     def _parse_adsb(self, csv_path: Path) -> list:
@@ -396,19 +437,20 @@ class PortalSync:
             return []
         import csv as _csv
         aircraft: dict = {}
-        try:
-            with open(csv_path, "r", encoding="utf-8", newline="") as f:
-                reader = _csv.reader(f)
-                if next(reader, None) is None:
-                    return []
-                for parts in reader:
+        bad = 0
+        # A whole-file read error (OSError) propagates so the session stays
+        # PENDING; per-record errors are isolated so one bad value (e.g. an 'inf'
+        # altitude raising OverflowError) can't truncate the rest (#9).
+        with open(csv_path, "r", encoding="utf-8", newline="") as f:
+            reader = _csv.reader(f)
+            if next(reader, None) is None:
+                return []
+            for parts in reader:
+                try:
                     if len(parts) < 8:
                         continue
-                    try:
-                        lat = float(parts[3]) if parts[3] else 0.0
-                        lon = float(parts[4]) if parts[4] else 0.0
-                    except ValueError:
-                        continue
+                    lat = float(parts[3]) if parts[3] else 0.0
+                    lon = float(parts[4]) if parts[4] else 0.0
                     if not _in_bounds(lat, lon):
                         continue
                     icao = parts[1]
@@ -418,7 +460,7 @@ class PortalSync:
                         alt = int(float(parts[5])) if parts[5] else 0
                         spd = int(float(parts[6])) if parts[6] else 0
                         hdg = int(float(parts[7])) if parts[7] else 0
-                    except ValueError:
+                    except (ValueError, OverflowError):
                         alt = spd = hdg = 0
                     aircraft[icao] = {
                         "icao": icao, "callsign": parts[2],
@@ -426,8 +468,11 @@ class PortalSync:
                         "speed_kt": spd, "heading": hdg,
                         "first_seen": parts[0], "type": "ADSB",
                     }
-        except Exception as e:
-            self._log(f"ADS-B parse error: {e}", "warn")
+                except Exception:
+                    bad += 1
+                    continue
+        if bad:
+            self._log(f"  {csv_path.name}: skipped {bad} malformed aircraft row(s)", "warn")
         return list(aircraft.values())
 
     def _parse_meshcore(self, csv_path: Path) -> list:
@@ -435,19 +480,19 @@ class PortalSync:
             return []
         import csv as _csv
         nodes: dict = {}
-        try:
-            with open(csv_path, "r", encoding="utf-8", newline="") as f:
-                reader = _csv.reader(f)
-                if next(reader, None) is None:
-                    return []
-                for parts in reader:
+        bad = 0
+        # Whole-file read error propagates (session stays pending); per-record
+        # errors are isolated and counted (#9).
+        with open(csv_path, "r", encoding="utf-8", newline="") as f:
+            reader = _csv.reader(f)
+            if next(reader, None) is None:
+                return []
+            for parts in reader:
+                try:
                     if len(parts) < 6:
                         continue
-                    try:
-                        lat = float(parts[4]) if parts[4] else 0.0
-                        lon = float(parts[5]) if parts[5] else 0.0
-                    except ValueError:
-                        continue
+                    lat = float(parts[4]) if parts[4] else 0.0
+                    lon = float(parts[5]) if parts[5] else 0.0
                     if not _in_bounds(lat, lon):
                         continue
                     node_id = parts[1]
@@ -462,8 +507,11 @@ class PortalSync:
                         "name": parts[3], "lat": lat, "lon": lon,
                         "rssi": rssi, "first_seen": parts[0], "type": "MESHCORE",
                     }
-        except Exception as e:
-            self._log(f"MeshCore parse error: {e}", "warn")
+                except Exception:
+                    bad += 1
+                    continue
+        if bad:
+            self._log(f"  {csv_path.name}: skipped {bad} malformed mesh row(s)", "warn")
         return list(nodes.values())
 
     # ------------------------------------------------------------------
@@ -525,16 +573,36 @@ class PortalSync:
         with self._open(req, timeout=90) as resp:
             status = getattr(resp, "status", None) or resp.getcode()
             data = self._read_json(resp, f"HTTP {status}")
-        if status == 202 and data.get("job_id"):
-            self._log(f"  <- accepted in {time.time() - t0:.1f} s, queued as job {data['job_id']}"
-                      " - waiting for the receipt", "raw")
-            ra = data.get("retry_after")
-            return self._poll_job(data["job_id"],
-                                  first_wait=float(ra) if isinstance(ra, (int, float)) and 0 < ra <= 60 else 2.0)
+        if status == 202:
+            if data.get("job_id"):
+                self._log(f"  <- accepted in {time.time() - t0:.1f} s, queued as job {data['job_id']}"
+                          " - waiting for the receipt", "raw")
+                ra = data.get("retry_after")
+                return self._poll_job(data["job_id"],
+                                      first_wait=float(ra) if isinstance(ra, (int, float)) and 0 < ra <= 60 else 2.0)
+            # Accepted (202) but no job id: there is no way to confirm the import,
+            # so this is NOT a receipt. Keep the batch pending and re-send next sync
+            # (the idempotency key dedups it server-side) (#7).
+            raise _EmptyAnswer("HTTP 202 without a job id - import unconfirmed")
+        # Synchronous answer: only a validated receipt confirms the import. An empty
+        # or receipt-less 2xx body must leave the batch pending, not close it (#7).
+        if not self._is_receipt(data):
+            raise _EmptyAnswer(f"HTTP {status} without a receipt - import unconfirmed")
         rid = data.get("receipt_id")
         self._log(f"  <- HTTP {status}, receipt {rid if rid else '-'}"
                   + (" (the portal already had this batch)" if data.get("idempotent_replay") else ""), "raw")
         return data
+
+    @staticmethod
+    def _is_receipt(data: dict) -> bool:
+        """True when a synchronous answer is an actual import receipt: it carries a
+        receipt id, is an idempotent replay, or reports at least one counted field.
+        A bare {} or a status-only body is not a receipt."""
+        if not isinstance(data, dict):
+            return False
+        if data.get("receipt_id") or data.get("idempotent_replay"):
+            return True
+        return any(k in data for k in _AGG_FIELDS)
 
     # ---- the conversation with the portal, readable in the game console ----
     @staticmethod
@@ -1052,12 +1120,22 @@ class PortalSync:
     # ------------------------------------------------------------------
     # /api/device-pair — pair by short code instead of pasting a 64-hex key
     # ------------------------------------------------------------------
-    def _save_secret(self, key: str, value: str) -> None:
-        """Upsert key=value in the repo-root secrets.conf (preserving the rest)."""
+    def _save_secret(self, key: str, value: str) -> bool:
+        """Upsert key=value in the repo-root secrets.conf (preserving the rest).
+
+        Returns True only when the key was actually persisted. A read error on an
+        existing file aborts WITHOUT writing, so a transient failure can't replace
+        the whole file (wiping other settings) with a single entry. The file is
+        written atomically (temp + rename) at mode 0600 so it is never left
+        half-written or world-readable (#11, #3)."""
         path = Path(__file__).resolve().parent.parent / "secrets.conf"
-        try:
-            lines = path.read_text().splitlines() if path.is_file() else []
-        except Exception:
+        if path.is_file():
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except OSError as e:
+                log.error("secrets.conf unreadable, not overwriting: %s", e)
+                return False
+        else:
             lines = []
         out, found = [], False
         for ln in lines:
@@ -1068,10 +1146,33 @@ class PortalSync:
                 out.append(ln)
         if not found:
             out.append("%s=%s" % (key, value))
+        text = "\n".join(out) + "\n"
+        tmp = path.with_name(path.name + ".tmp")
         try:
-            path.write_text("\n".join(out) + "\n")
-        except Exception as e:
-            log.debug("save_secret failed: %s", e)
+            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(text)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+            finally:
+                try:
+                    os.chmod(tmp, 0o600)
+                except OSError:
+                    pass
+            os.replace(tmp, path)
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
+            return True
+        except OSError as e:
+            log.error("save_secret failed: %s", e)
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            return False
 
     def request_pair(self, label: str = "WatchDogsGo NG (uConsole)") -> Optional[dict]:
         """POST /api/device-pair action=request -> {code, poll, expires_in} or None."""
@@ -1099,10 +1200,13 @@ class PortalSync:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
-    def adopt_api_key(self, api_key: str) -> None:
-        """Persist a freshly paired key and use it immediately."""
+    def adopt_api_key(self, api_key: str) -> bool:
+        """Persist a freshly paired key and use it immediately. Returns False if the
+        key could NOT be written to secrets.conf, so the caller can warn that
+        pairing will not survive a restart (#11). The in-memory key is still set so
+        the current session works."""
         self._api_key = api_key
-        self._save_secret("WARDRIVE_API_KEY", api_key)
+        return self._save_secret("WARDRIVE_API_KEY", api_key)
 
     # ------------------------------------------------------------------
     # /api/game-state — portal state for the HUD (rank, team, decay, contracts)
