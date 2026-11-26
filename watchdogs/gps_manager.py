@@ -21,6 +21,7 @@ class GpsFix:
     longitude: float = 0.0
     altitude: float = 0.0
     speed_knots: float = 0.0
+    course_deg: float = 0.0    # course over ground, degrees true (RMC field 8)
     satellites: int = 0
     satellites_visible: int = 0
     fix_quality: int = 0       # 0=no fix, 1=GPS, 2=DGPS
@@ -361,7 +362,7 @@ class GpsManager:
         if len(p) < 8:
             return
         valid = (p[2] == "A")
-        lat = lon = speed = None
+        lat = lon = speed = course = None
         if valid:
             if not (p[3] and p[4] and p[5] and p[6]):
                 return
@@ -377,6 +378,13 @@ class GpsManager:
                     speed = float(p[7])
                 except ValueError:
                     speed = None
+            if len(p) > 8 and p[8]:
+                try:
+                    course = float(p[8])
+                except ValueError:
+                    course = None
+                if course is not None and not (0.0 <= course <= 360.0):
+                    course = None
         self.fix.valid = valid
         if p[1]:
             self.fix.timestamp = p[1]
@@ -385,6 +393,8 @@ class GpsManager:
             self.fix.longitude = lon
             if speed is not None:
                 self.fix.speed_knots = speed
+            if course is not None:
+                self.fix.course_deg = course
             self._mark_fix_time()
 
     def _parse_gsv(self, p: List[str]) -> None:
