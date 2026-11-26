@@ -2109,8 +2109,14 @@ def main():
                     d_lbl = ("%.0fkm %s" % (dk, rb.get("compass") or "")
                              if dk >= 1 else "%.0fm %s" % (dk * 1000, rb.get("compass") or ""))
                     lw = tw(mono, d_lbl, 13)
-                    lx = min(W - lw - 6, max(mapx0 + 6, ex - math.cos(math.radians(ang)) * 26 - lw / 2))
-                    ly = min(by1 - 16, max(by0 + 4, ey - math.sin(math.radians(ang)) * 26 - 7))
+                    # Step the label back along the ray far enough that its box clears the
+                    # arrow and its pulse ring (radius up to 16). A fixed 26 px was too little
+                    # for a wide label pointing W or E: the arrow covered its first or last
+                    # digits ("410km W" read as "10km W").
+                    ux, uy = math.cos(math.radians(ang)), math.sin(math.radians(ang))
+                    back = 22 + abs(ux) * lw / 2 + abs(uy) * 7
+                    lx = min(W - lw - 6, max(mapx0 + 6, ex - ux * back - lw / 2))
+                    ly = min(by1 - 16, max(by0 + 4, ey - uy * back - 7))
                     text(mono, d_lbl, lx, ly, 13, rc)
                 break
 
