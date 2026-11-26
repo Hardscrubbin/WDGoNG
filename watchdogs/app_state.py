@@ -111,6 +111,8 @@ class AppState:
     gps_longitude: float = 0.0
     gps_altitude: float = 0.0
     gps_satellites: int = 0
+    gps_speed_kmh: float = 0.0
+    gps_heading: float = 0.0
     gps_satellites_visible: int = 0
     gps_fix_quality: int = 0
     gps_hdop: float = 99.9

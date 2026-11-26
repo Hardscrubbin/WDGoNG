@@ -1006,6 +1006,9 @@ class Backend:
                     self.state.gps_longitude = f.longitude
                     self.state.gps_satellites = f.satellites
                     self.state.gps_satellites_visible = f.satellites_visible
+                    # EXTRAS read these through ctx.gps.fix() (speed_kmh, heading)
+                    self.state.gps_speed_kmh = f.speed_knots * 1.852
+                    self.state.gps_heading = f.course_deg
                     # Feed the live fix to the SDR loggers. start_emergency/433/adsb
                     # only got the position ONCE at start (0,0 before the first fix),
                     # and nothing refreshed it — so every emergency_rf.csv row was
