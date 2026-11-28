@@ -56,22 +56,65 @@ def sshsig(q: bytes, r: bytes, s: bytes) -> str:
     return "-----BEGIN SSH SIGNATURE-----\n%s\n-----END SSH SIGNATURE-----\n" % "\n".join(lines)
 
 
+def _open_port(port):
+    import serial
+    ser = serial.Serial()
+    ser.port, ser.baudrate, ser.timeout = port, 115200, 0.2
+    ser.exclusive = True        # one program per port: a busy port fails fast instead of mixing replies
+    ser.open()
+    # The OS raises DTR+RTS on open (idle). Dropping DTR first would pass through
+    # DTR=0/RTS=1, which is the chip's reset line - so release RTS first, then DTR.
+    ser.rts = False
+    ser.dtr = False
+    time.sleep(0.3)
+    ser.reset_input_buffer()
+    return ser
+
+
+def _is_lsp_key(ser, timeout=2.0) -> bool:
+    """True when the device on `ser` answers `info` the way the LSP KEY firmware does.
+    Other boards (e.g. a cluster bridge on the same Mac) are left alone: they only see
+    one unknown `info` line."""
+    ser.write(b"info\n")
+    end, buf = time.time() + timeout, b""
+    while time.time() < end:
+        buf += ser.read(256)
+        while b"\n" in buf:
+            ln, buf = buf.split(b"\n", 1)
+            ln = ln.strip().decode("utf-8", "replace")
+            if ln.startswith("@OK info ") and " pub=" in ln:
+                return True
+    return False
+
+
+def find_dongle():
+    """(port, open serial) of the first device that answers as an LSP KEY, else (None, None).
+    Busy ports (e.g. held by the dashboard) are skipped."""
+    for port in sorted(glob.glob("/dev/cu.usbmodem*") + glob.glob("/dev/ttyACM*")):
+        try:
+            ser = _open_port(port)
+        except Exception:
+            continue
+        try:
+            if _is_lsp_key(ser):
+                ser.reset_input_buffer()
+                return port, ser
+        except Exception:
+            pass
+        ser.close()
+    return None, None
+
+
 class Dongle:
     def __init__(self, port=None):
-        import serial
-        port = port or os.environ.get("HUB_DONGLE_PORT") or next(
-            iter(sorted(glob.glob("/dev/cu.usbmodem*") + glob.glob("/dev/ttyACM*"))), None)
-        if not port:
-            raise SystemExit("no dongle found (set HUB_DONGLE_PORT)")
-        self.ser = serial.Serial()
-        self.ser.port, self.ser.baudrate, self.ser.timeout = port, 115200, 0.2
-        self.ser.open()
-        # The OS raises DTR+RTS on open (idle). Dropping DTR first would pass through
-        # DTR=0/RTS=1, which is the chip's reset line - so release RTS first, then DTR.
-        self.ser.rts = False
-        self.ser.dtr = False
-        time.sleep(0.3)
-        self.ser.reset_input_buffer()
+        port = port or os.environ.get("HUB_DONGLE_PORT")
+        if port:
+            self.port, self.ser = port, _open_port(port)
+            return
+        self.port, self.ser = find_dongle()
+        if not self.ser:
+            raise SystemExit("no LSP KEY found on any free serial port (plug it in, close the "
+                             "LSP KEY dashboard if it is running, or set HUB_DONGLE_PORT)")
 
     def cmd(self, line, timeout=20.0) -> str:
         self.ser.write((line + "\n").encode())
