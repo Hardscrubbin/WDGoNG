@@ -4,7 +4,7 @@ The hub is how other people's extras reach players **without ever being trusted*
 
     author PR -> CI gate (hub_check.py) -> maintainer review -> merge
               -> CI rebuilds the CANDIDATE (pending/index.json) - CI never signs
-              -> maintainer signs offline (hub_release.py + signing dongle) -> index.json + .sig
+              -> maintainer signs offline with a hardware key -> index.json + .sig
     game:  fetch hub -> verify signature -> verify per-extra checksum -> install
            -> consent card -> run in the Phase-2 sandbox
 
@@ -21,18 +21,17 @@ radios, reach the network or the filesystem.
 | `wdgong_ui/extras_hub_signers` | the hub's PUBLIC key (OpenSSH `allowed_signers` line). Not present = hub disabled |
 | `extras/hub/hub_check.py` | CI gate for one extra (manifest, files, import allowlist, forbidden calls, permissions, sandbox smoke run) |
 | `extras/hub/hub_build_index.py` | deterministic catalogue with each extra's content hash (`--out pending/index.json` in CI) |
-| `extras/hub/hub_release.py` | maintainer: rebuild locally, compare with the candidate, show the changes, sign, publish |
-| `extras/hub/dongle/`, `hub_dongle.py`, `hub_dongle_web.py` | the signing dongle: firmware, CLI, local key-manager dashboard |
 | `extras/hub/make_hub_repo.sh` | assembles the hub repository skeleton (template + tools + SDK copy) |
 | `extras/sim/test_hub.py` | end-to-end tests incl. forged index / wrong key / changed code |
-| `extras/sim/test_hub_release.py` | offline-release tests incl. edited candidate / unknown key / stale candidate |
+
+The signing tooling (the hardware key and the release tool that drives it) is the
+maintainer's own and is not part of this repository.
 
 ## One-time setup
 
-1. **Signing key** lives in the signing dongle (see *Signing dongle* below) - never in
-   git, never in chat, never on a CI runner. There is no `HUB_SIGNING_KEY` secret.
-2. **Public half into the game**: one line per key in `wdgong_ui/extras_hub_signers`
-   (`hub_dongle.py pubkey` prints it):
+1. **Signing key** lives in the maintainer's hardware key - never in git, never in
+   chat, never on a CI runner. There is no `HUB_SIGNING_KEY` secret.
+2. **Public half into the game**: one line per key in `wdgong_ui/extras_hub_signers`:
    ```
    wdgo-extras-hub ecdsa-sha2-nistp256 AAAA...
    ```
@@ -52,37 +51,11 @@ radios, reach the network or the filesystem.
 ## Releasing (after a merge)
 
 CI commits `pending/index.json` (and the portal DMs the maintainer via BEACON).
-Players keep the last signed release until it is signed. Easiest: open the key
-manager (desktop launcher "LSP KEY"), section **Do podpisu**: one card per kind of
-signature, each with its own "Podpisz i opublikuj" button, plus "Podpisz i opublikuj
-wszystkie" when more than one kind is waiting. The same from a terminal:
-
-    extras/hub/hub_release.py /path/to/hub-clone
-
-New kinds of signature are added in `extras/hub/signing_purposes.py` (one class per
-kind) together with the matching namespace in the dongle firmware.
-
-The terminal tool pulls, rebuilds the catalogue from the checked-out `extras/` and refuses unless
-the candidate is byte-identical; prints new / updated / NEW PERMISSION / removed and
-the changed files; asks for the dongle (PIN on the device); checks the signature
-against `extras_hub_signers`; commits and pushes `index.json` + `index.json.sig`.
-Close the key-manager dashboard first (one program per serial port). If the dongle
-answers that the digest does not match right after a push, the file server has not
-refreshed yet - wait a few minutes.
-
-Emergency without the dongle: `--key <encrypted backup file>` signs with the backup.
-
-## Signing dongle
-
-A LilyGO T-Dongle-C5 running `extras/hub/dongle/` (ESP-IDF 5.5, `./build.sh --preview
--p <port> flash`). It builds the SSHSIG blob itself with the fixed namespace, so the
-key signs hub catalogues and nothing else. It fetches `index.json` and
-`pending/index.json` over Wi-Fi on its own and signs only the digest of the candidate
-it downloaded. Optional PIN typed on the device (short press +1, long press accept);
-with a PIN the key is stored wrapped under it. One-time encrypted export for a
-backup, `import` to restore. `hub_dongle_web.py` is a dashboard on 127.0.0.1 for
-name, Wi-Fi, hub address, PIN, backup. Current firmware is a DEV build (software key
-in flash); an eFuse-backed build with secure boot is a later, irreversible step.
+Players keep the last signed release until the maintainer signs the new candidate.
+The maintainer rebuilds the catalogue locally, refuses unless the candidate is
+byte-identical, reviews new / updated / NEW PERMISSION / removed entries, signs with
+the hardware key, checks the signature against `extras_hub_signers` and pushes
+`index.json` + `index.json.sig`.
 
 ## Ratings (banana = yes, peel = no)
 
