@@ -31,6 +31,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import hub_dongle as hd                                   # noqa: E402
 
 PORT = 8790
+# Shown in the page's top-right corner. Bump on every change to this dashboard or to
+# hub_dongle.py, so it is obvious whether the running copy is the new one.
+VERSION = "1.1"
 
 
 def _token():
@@ -368,7 +371,8 @@ PAGE = r"""<!doctype html><html lang="pl"><head><meta charset="utf-8">
 --mango:#ffb02e;--mango2:#ff8a1f;--ok:#4cd67a;--bad:#ff5f56;--ink:#140f04}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--txt);
 font:15px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
-header{background:var(--mango);color:var(--ink);padding:16px 20px}
+header{background:var(--mango);color:var(--ink);padding:16px 20px;position:relative}
+#ver{position:absolute;top:8px;right:14px;font-size:12px;opacity:.75}
 header>div{max-width:980px;margin:0 auto}
 h1{margin:0;font-size:26px;letter-spacing:1px}h1 small{font-size:13px;font-weight:400;opacity:.75}
 .sub{font-size:13px;opacity:.75}
@@ -392,7 +396,7 @@ pre{background:#0e0c09;border:1px solid var(--edge);border-radius:6px;padding:10
 #msg{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:9;max-width:min(92vw,900px);background:#211c12;border:2px solid var(--mango);border-radius:10px;padding:12px 18px;font-size:15px;box-shadow:0 6px 24px #000a}#msg:empty{display:none}main{padding-bottom:90px}
 ol{margin:6px 0 0;padding-left:20px}
 </style></head><body>
-<header><div><h1><span id="t-name">…</span> <small>zarządzanie kluczem · tylko ten komputer, po USB</small></h1>
+<header><span id="ver">dashboard v__VERSION__</span><div><h1><span id="t-name">…</span> <small>zarządzanie kluczem · tylko ten komputer, po USB</small></h1>
 <div class="sub" id="t-sub"></div></div></header>
 <div id="msg"></div>
 <main>
@@ -563,7 +567,12 @@ function qRender(j){
 async function qWatch(){
   try{ const j=await api("/api/job"); qRender(j);
     if(j.state==="running"){ busy=true; qPoll=setTimeout(qWatch,1500); }
-    else { busy=false; qPoll=null; if(j.kind==="publish" && j.state==="done") say("Gotowe: "+j.result,"ok"); load(); }
+    else { busy=false; qPoll=null;
+      if(j.state==="error") say(j.error||"Zadanie nie powiodło się","bad");
+      else if(j.kind==="publish" && j.state==="done") say("Gotowe: "+j.result,"ok");
+      else if(j.kind==="check" && j.state==="done") say(j.result||"Sprawdzono",
+        (j.checks||[]).some(c=>c.ready)?"warn":"ok");
+      load(); }
   }catch(e){ busy=false; say(e.message,"bad"); }
 }
 async function qCheck(){ try{ await api("/api/queue/check",{}); say("Sprawdzam, co czeka na podpis…","dim"); qWatch(); }catch(e){ say(e.message,"bad"); } }
@@ -596,7 +605,7 @@ class H(BaseHTTPRequestHandler):
         if not self._allowed():
             return self._send(403, {"error": "forbidden"})
         if self.path == "/?k=" + TOKEN:
-            return self._send(200, html=PAGE.replace("__TOKEN__", TOKEN))
+            return self._send(200, html=PAGE.replace("__TOKEN__", TOKEN).replace("__VERSION__", VERSION))
         if self.path == "/api/job" and secrets.compare_digest(self.headers.get("X-Key-Token", ""), TOKEN):
             return self._send(200, dict(JOB, checks=list(CHECKS.values())))   # never touches the dongle
         if self.path == "/api/state" and secrets.compare_digest(self.headers.get("X-Key-Token", ""), TOKEN):
