@@ -4969,9 +4969,17 @@ class Backend:
         """Accept ONLY regular files/dirs under loot/ or a single top-level
         secrets.conf. Reject symlinks/hardlinks/devices, absolute paths, '..'
         escapes and anything else — enforced on EVERY Python version (no reliance
-        on tar's data filter), so a crafted archive can never write app code."""
+        on tar's data filter), so a crafted archive can never write app code.
+
+        A backslash is NOT rejected: on Linux (the only platform this runs on) it
+        is an ordinary filename character, not a path separator, and loot file
+        names embed the SSID, which can contain one (e.g. a handshake capture
+        \'AA-BB_Cafe\\Bar.22000\'). Names are split on \'/\' only and \'..\' parts
+        are refused below, so a backslash cannot escape the extraction dir. The
+        earlier blanket backslash check aborted the WHOLE restore on the first
+        such file, which is why some 0.10.6 -> 0.11.0 restores failed."""
         name = m.name or ""
-        if name.startswith("/") or "\\" in name or "\x00" in name:
+        if name.startswith("/") or "\x00" in name:
             return False
         parts = [p for p in name.split("/") if p not in ("", ".")]
         if not parts or any(p == ".." for p in parts):
